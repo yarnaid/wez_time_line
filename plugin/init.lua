@@ -154,6 +154,24 @@ local function teardown_all()
   for main_id in pairs(wezterm.GLOBAL.line_time.gutter) do close_gutter(main_id) end
 end
 
+-- Sweep gutter mapping for entries whose main pane has died. Typical trigger:
+-- user pressed Ctrl+D in the main pane, the shell exited, WezTerm dropped the
+-- pane — but the sibling gutter (running `sleep`) is still alive, so the tab
+-- survives with only timestamps on screen. Reaping the orphan lets the tab/
+-- window close in turn. Worst-case latency = one update-status tick (~1s).
+-- Also self-heals stale entries left over from config reloads or earlier
+-- crashes, since wezterm.GLOBAL outlives the Lua VM.
+local function reap_orphan_gutters()
+  local dead = {}
+  for main_key in pairs(wezterm.GLOBAL.line_time.gutter) do
+    local pid = tonumber(main_key)
+    if not pid or not wezterm.mux.get_pane(pid) then
+      dead[#dead + 1] = main_key
+    end
+  end
+  for _, key in ipairs(dead) do close_gutter(key) end
+end
+
 -- Lazy-opens the gutter for any main pane that doesn't have one yet. This is
 -- how the plugin becomes visible on a fresh process (enabled=true by default
 -- but apply_to_config runs before mux has any windows — only update-status
@@ -164,6 +182,7 @@ end
 local function tick()
   if not wezterm.GLOBAL.line_time then return end
   if not wezterm.GLOBAL.line_time.enabled then return end
+  reap_orphan_gutters()
   each_main_pane(function(pane)
     local id = k(pane:pane_id())
     if not wezterm.GLOBAL.line_time.gutter[id] then
