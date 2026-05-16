@@ -30,6 +30,8 @@ end
 -- to a cached local do NOT propagate. So we never cache; every mutation goes
 -- through wezterm.GLOBAL.line_time directly, which IS proxied for writes
 -- (since wezterm 20230320-124340).
+-- Also: wezterm.GLOBAL is JSON-like, so nested-table keys must be strings.
+-- pane_id() returns a number → always stringify before indexing.
 local function init_state()
   if wezterm.GLOBAL.line_time == nil then
     wezterm.GLOBAL.line_time = {
@@ -37,6 +39,8 @@ local function init_state()
     }
   end
 end
+
+local function k(pane_id) return tostring(pane_id) end
 
 local function is_gutter(pane_id)
   for _, gid in pairs(wezterm.GLOBAL.line_time.gutter) do
@@ -52,7 +56,7 @@ local function count_lines(text)
 end
 
 local function open_gutter(main_pane)
-  local id = main_pane:pane_id()
+  local id = k(main_pane:pane_id())
   dbg('open_gutter pane=', id)
   if wezterm.GLOBAL.line_time.gutter[id] then
     dbg('open_gutter pane=', id, 'already has gutter, skip')
@@ -79,8 +83,11 @@ local function open_gutter(main_pane)
 end
 
 local function close_gutter(main_id)
-  local gid = wezterm.GLOBAL.line_time.gutter[main_id]
-  dbg('close_gutter main_id=', main_id, 'gutter_id=', gid)
+  -- main_id may arrive as number (from is_gutter caller) or string (from
+  -- pairs() iteration over GLOBAL table). Normalise.
+  local key = k(main_id)
+  local gid = wezterm.GLOBAL.line_time.gutter[key]
+  dbg('close_gutter main_id=', key, 'gutter_id=', gid)
   if not gid then return end
   local gpane = wezterm.mux.get_pane(gid)
   if gpane then
@@ -89,13 +96,13 @@ local function close_gutter(main_id)
   else
     dbg('close_gutter: gutter pane', gid, 'not found in mux')
   end
-  wezterm.GLOBAL.line_time.gutter[main_id] = nil
-  wezterm.GLOBAL.line_time.stamps[main_id] = nil
-  wezterm.GLOBAL.line_time.last_count[main_id] = nil
+  wezterm.GLOBAL.line_time.gutter[key] = nil
+  wezterm.GLOBAL.line_time.stamps[key] = nil
+  wezterm.GLOBAL.line_time.last_count[key] = nil
 end
 
 local function record_new_lines(main_pane)
-  local id = main_pane:pane_id()
+  local id = k(main_pane:pane_id())
   local dims = main_pane:get_dimensions()
   local text = main_pane:get_logical_lines_as_text(dims.scrollback_rows)
   local count = count_lines(text)
@@ -103,19 +110,19 @@ local function record_new_lines(main_pane)
   if count <= prev then return end
   local now = os.date '%H:%M:%S'
   for i = prev + 1, count do
-    wezterm.GLOBAL.line_time.stamps[id][i] = now
+    wezterm.GLOBAL.line_time.stamps[id][tostring(i)] = now
   end
   wezterm.GLOBAL.line_time.last_count[id] = count
 end
 
 local function render_gutter(main_pane, gutter_pane)
-  local id = main_pane:pane_id()
+  local id = k(main_pane:pane_id())
   local total = wezterm.GLOBAL.line_time.last_count[id] or 0
   local viewport = main_pane:get_dimensions().viewport_rows
   local first = math.max(1, total - viewport + 1)
   local lines = {}
   for i = first, total do
-    lines[#lines + 1] = wezterm.GLOBAL.line_time.stamps[id][i] or ''
+    lines[#lines + 1] = wezterm.GLOBAL.line_time.stamps[id][tostring(i)] or ''
   end
   gutter_pane:inject_output(CLEAR_HOME .. table.concat(lines, '\r\n'))
 end
@@ -151,7 +158,7 @@ local function tick()
   if not wezterm.GLOBAL.line_time then return end
   if not wezterm.GLOBAL.line_time.enabled then return end
   each_main_pane(function(pane)
-    local gid = wezterm.GLOBAL.line_time.gutter[pane:pane_id()]
+    local gid = wezterm.GLOBAL.line_time.gutter[k(pane:pane_id())]
     local gpane = gid and wezterm.mux.get_pane(gid)
     if not gpane then return end
     record_new_lines(pane)
@@ -186,8 +193,8 @@ function M.apply_to_config(config, opts)
   -- times per reload across validation threads). Avoid stacking duplicate
   -- Cmd+E entries inside the same config.keys list.
   local bound = false
-  for _, k in ipairs(config.keys) do
-    if k.key == 'e' and k.mods == 'CMD' then bound = true break end
+  for _, entry in ipairs(config.keys) do
+    if entry.key == 'e' and entry.mods == 'CMD' then bound = true break end
   end
   if not bound then
     table.insert(config.keys, {
