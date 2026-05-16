@@ -84,6 +84,7 @@ end
 local function open_gutter(main_pane)
   local id = k(main_pane:pane_id())
   if wezterm.GLOBAL.line_time.gutter[id] then return end
+  wezterm.log_info('line_time: opening gutter for pane ' .. id)
   -- pane:split focuses the new pane. Remember the tab's active pane first so
   -- we can hand focus back — otherwise a lazy-open from update-status (or a
   -- toggle while a sibling is focused) yanks the cursor into the gutter.
@@ -97,7 +98,7 @@ local function open_gutter(main_pane)
   wezterm.GLOBAL.line_time.last_count[id] = 0
   wezterm.GLOBAL.line_time.viewport_top[id] = 0
   if prev_active and prev_active:pane_id() ~= gutter:pane_id() then
-    prev_active:activate()
+    pcall(function() prev_active:activate() end)
   end
 end
 
@@ -153,11 +154,21 @@ local function render_gutter(main_pane, gutter_pane)
   gutter_pane:inject_output(CLEAR_HOME .. table.concat(lines, '\r\n'))
 end
 
+-- pcall on the per-pane callback so a single failure (e.g. pane:split
+-- raising for a freshly-spawned window before WezTerm finishes wiring up
+-- its GUI surface) doesn't abort iteration over the rest of the panes.
+-- Errors are written to ~/.local/share/wezterm/wezterm-gui.log on macOS;
+-- see `wezterm show-log` for live tailing.
 local function each_main_pane(fn)
   for _, mux_win in ipairs(wezterm.mux.all_windows()) do
     for _, tab in ipairs(mux_win:tabs()) do
       for _, pane in ipairs(tab:panes()) do
-        if not is_gutter(pane:pane_id()) then fn(pane) end
+        if not is_gutter(pane:pane_id()) then
+          local ok, err = pcall(fn, pane)
+          if not ok then
+            wezterm.log_error('line_time: pane ' .. tostring(pane:pane_id()) .. ' failed: ' .. tostring(err))
+          end
+        end
       end
     end
   end
