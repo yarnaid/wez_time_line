@@ -66,6 +66,18 @@ local viewport_top = {}   -- [main_id] = pinned top row (0 = follow live tail)
 -- "shell exited but exit_behavior=Hold is keeping the pane around" (do reap).
 local proc_seen = {}      -- [main_id] = true once we've seen any fg process
 
+-- wezterm.mux.get_pane(id) THROWS a Lua error when the pane id is unknown,
+-- contrary to what one would expect from "get" semantics. Wrap it: a missing
+-- pane is a normal flow ("did this pane die yet?") and must not abort the
+-- reaper or any other caller. Without this wrapper every Ctrl+D path threw
+-- silently inside the event handler.
+local function safe_get_pane(id)
+  if not id then return nil end
+  local ok, pane = pcall(wezterm.mux.get_pane, id)
+  if not ok then return nil end
+  return pane
+end
+
 local function count_lines(text)
   local n = 0
   for _ in text:gmatch '\n' do n = n + 1 end
@@ -197,7 +209,7 @@ end
 local function close_gutter(main_id)
   local gid = gutters[main_id]
   if not gid then return end
-  kill_pane(wezterm.mux.get_pane(gid))
+  kill_pane(safe_get_pane(gid))
   clear_state(main_id)
 end
 
@@ -264,7 +276,7 @@ end
 local function reap_orphan_gutters()
   local to_kill = {}
   for main_id in pairs(gutters) do
-    local mp = wezterm.mux.get_pane(main_id)
+    local mp = safe_get_pane(main_id)
     if not mp then
       to_kill[#to_kill + 1] = { main_id = main_id, mp = nil }
     else
@@ -323,7 +335,7 @@ local function tick()
   if tick_n % 3 == 0 then
     local entries = {}
     for k, v in pairs(gutters) do
-      local mp = wezterm.mux.get_pane(k)
+      local mp = safe_get_pane(k)
       local proc = mp and mp:get_foreground_process_info()
       entries[#entries + 1] = string.format(
         '%s=>%s(mux=%s,proc=%s)',
@@ -343,7 +355,7 @@ local function tick()
       open_gutter(pane)
       return
     end
-    local gpane = wezterm.mux.get_pane(gutters[id])
+    local gpane = safe_get_pane(gutters[id])
     if not gpane then
       -- Mapping points at a dead gutter — drop it so open_gutter tries again
       -- (or reclaims a sibling that's still alive) next tick.
@@ -384,7 +396,7 @@ local function on_scroll(delta_fn)
     else
       viewport_top[id] = new_top
     end
-    local gpane = wezterm.mux.get_pane(gid)
+    local gpane = safe_get_pane(gid)
     if gpane then render_gutter(pane, gpane) end
   end)
 end
