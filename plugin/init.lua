@@ -84,7 +84,7 @@ end
 local function open_gutter(main_pane)
   local id = k(main_pane:pane_id())
   if wezterm.GLOBAL.line_time.gutter[id] then return end
-  wezterm.log_info('line_time: opening gutter for pane ' .. id)
+  wezterm.log_warn('[line_time] opening gutter for pane ' .. id)
   -- pane:split focuses the new pane. Remember the tab's active pane first so
   -- we can hand focus back — otherwise a lazy-open from update-status (or a
   -- toggle while a sibling is focused) yanks the cursor into the gutter.
@@ -206,11 +206,22 @@ end
 -- left alone — open_gutter is no-op when gid is present, regardless of
 -- whether the underlying mux pane is still alive.
 local function tick()
-  if not wezterm.GLOBAL.line_time then return end
-  if not wezterm.GLOBAL.line_time.enabled then return end
+  if not wezterm.GLOBAL.line_time then
+    wezterm.log_warn('[line_time] tick: no state, returning')
+    return
+  end
+  if not wezterm.GLOBAL.line_time.enabled then
+    wezterm.log_warn('[line_time] tick: disabled, returning')
+    return
+  end
+  local window_count = #wezterm.mux.all_windows()
+  wezterm.log_warn('[line_time] tick: enabled=true, windows=' .. window_count)
   reap_orphan_gutters()
+  local seen = 0
   each_main_pane(function(pane)
+    seen = seen + 1
     local id = k(pane:pane_id())
+    wezterm.log_warn('[line_time] tick: main pane ' .. id .. ', has_gutter=' .. tostring(wezterm.GLOBAL.line_time.gutter[id] ~= nil))
     if not wezterm.GLOBAL.line_time.gutter[id] then
       open_gutter(pane)
       return
@@ -220,6 +231,7 @@ local function tick()
     record_new_lines(pane)
     render_gutter(pane, gpane)
   end)
+  wezterm.log_warn('[line_time] tick: saw ' .. seen .. ' main panes')
 end
 
 local function toggle()
