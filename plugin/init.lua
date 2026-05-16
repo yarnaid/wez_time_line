@@ -23,9 +23,7 @@ local act = wezterm.action
 local GUTTER_WIDTH = 10
 local GUTTER_CMD = { 'sleep', '2147483647' }
 local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
--- Absolute path to the wezterm binary we're running inside. Used for
--- `wezterm cli kill-pane` from close_gutter — see the rationale there.
-local WEZTERM_BIN = wezterm.executable_dir .. '/wezterm'
+local CLOSE_PANE = wezterm.action.CloseCurrentPane { confirm = false }
 
 -- wezterm.GLOBAL gotchas (verified empirically against 20240203):
 --   1. `local t = wezterm.GLOBAL.X; t.Y = Z` does NOT propagate — reads return
@@ -103,20 +101,26 @@ local function open_gutter(main_pane)
   end
 end
 
--- Force-kill the gutter via the CLI rather than `send_text '\x03'`. SIGINT
--- makes `sleep` exit with status 130, which the default exit_behavior =
--- "CloseOnCleanExit" treats as a dirty exit — the pane would be held open,
--- leaving a now-full-width gutter on screen and preventing the tab from
--- closing after the main pane went away. kill-pane shuts the PTY down
--- unconditionally. background_child_process is fire-and-forget; the next
--- tick won't see the pane regardless.
+-- Close the gutter via the official CloseCurrentPane action — documented to
+-- "shut down the PTY and kill the process", which bypasses exit_behavior.
+-- We can't just `send_text '\x03'`: sleep exiting on SIGINT yields status
+-- 130, and the default exit_behavior = "CloseOnCleanExit" holds the pane
+-- open on non-zero exits, so the orphaned gutter would linger (full-width,
+-- since its main sibling is gone) and block the tab from closing. The CLI
+-- (wezterm cli kill-pane) was an earlier attempt — turned out to no-op in
+-- practice from inside background_child_process. perform_action requires a
+-- GUI window; derive it from the gutter pane itself so this works for any
+-- window, regardless of which one's update-status fired.
 local function close_gutter(main_id)
   local key = k(main_id)
   local gid = wezterm.GLOBAL.line_time.gutter[key]
   if not gid then return end
-  wezterm.background_child_process {
-    WEZTERM_BIN, 'cli', 'kill-pane', '--pane-id', tostring(gid),
-  }
+  local gpane = wezterm.mux.get_pane(gid)
+  if gpane then
+    local mux_win = gpane:window()
+    local gui_win = mux_win and mux_win:gui_window()
+    if gui_win then gui_win:perform_action(CLOSE_PANE, gpane) end
+  end
   wezterm.GLOBAL.line_time.gutter[key] = nil
   wezterm.GLOBAL.line_time.stamps[key] = nil
   wezterm.GLOBAL.line_time.last_count[key] = nil
