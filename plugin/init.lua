@@ -28,19 +28,23 @@ local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
 --      a snapshot. Always mutate through `wezterm.GLOBAL.line_time.X` directly.
 --   2. The store is JSON-like: nested-table keys must be strings. pane_id()
 --      returns a number → stringify via k() before indexing.
+-- Initialise each sub-table separately. wezterm.GLOBAL.line_time = {..., t={}}
+-- in one assignment empirically loses the empty nested tables — they come
+-- back as nil. Setting each field via wezterm.GLOBAL.line_time.X = {} works.
+-- This also serves as a hot-reload backfill: if the plugin was updated via
+-- wezterm.plugin.update_all() without a process restart, an older
+-- line_time table (missing newer fields like viewport_top) is still in
+-- wezterm.GLOBAL — fill in only the missing pieces.
+-- viewport_top[pid] = row index of the topmost visible row in the main pane.
+-- Absent/0 means "follow the live tail"; a positive number pins the gutter
+-- to that row even as new content arrives below.
 local function init_state()
-  if wezterm.GLOBAL.line_time == nil then
-    wezterm.GLOBAL.line_time = {
-      enabled = false,
-      gutter = {},
-      stamps = {},
-      last_count = {},
-      -- viewport_top[pid] = row index of the topmost visible row in the main
-      -- pane. Absent/0 means "follow the live tail"; a positive number pins
-      -- the gutter to that row even as new content arrives below.
-      viewport_top = {},
-    }
-  end
+  if wezterm.GLOBAL.line_time == nil then wezterm.GLOBAL.line_time = {} end
+  if wezterm.GLOBAL.line_time.enabled == nil then wezterm.GLOBAL.line_time.enabled = false end
+  if wezterm.GLOBAL.line_time.gutter == nil then wezterm.GLOBAL.line_time.gutter = {} end
+  if wezterm.GLOBAL.line_time.stamps == nil then wezterm.GLOBAL.line_time.stamps = {} end
+  if wezterm.GLOBAL.line_time.last_count == nil then wezterm.GLOBAL.line_time.last_count = {} end
+  if wezterm.GLOBAL.line_time.viewport_top == nil then wezterm.GLOBAL.line_time.viewport_top = {} end
 end
 
 local function k(pane_id) return tostring(pane_id) end
