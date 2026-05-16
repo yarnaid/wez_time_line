@@ -83,6 +83,11 @@ end
 local function open_gutter(main_pane)
   local id = k(main_pane:pane_id())
   if wezterm.GLOBAL.line_time.gutter[id] then return end
+  -- pane:split focuses the new pane. Remember the tab's active pane first so
+  -- we can hand focus back — otherwise a lazy-open from update-status (or a
+  -- toggle while a sibling is focused) yanks the cursor into the gutter.
+  local tab = main_pane:tab()
+  local prev_active = tab and tab:active_pane()
   local gutter = main_pane:split {
     direction = 'Right', size = GUTTER_WIDTH, args = GUTTER_CMD,
   }
@@ -90,6 +95,9 @@ local function open_gutter(main_pane)
   wezterm.GLOBAL.line_time.stamps[id] = {}
   wezterm.GLOBAL.line_time.last_count[id] = 0
   wezterm.GLOBAL.line_time.viewport_top[id] = 0
+  if prev_active and prev_active:pane_id() ~= gutter:pane_id() then
+    prev_active:activate()
+  end
 end
 
 local function close_gutter(main_id)
