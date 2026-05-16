@@ -19,19 +19,11 @@ local GUTTER_WIDTH = 10
 local GUTTER_CMD = { 'sleep', '2147483647' }
 local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
 
--- DIAG: temporary diagnostics. log_error is always written to the gui log.
-local function dbg(...)
-  local parts = { '[line_time]' }
-  for i = 1, select('#', ...) do parts[#parts + 1] = tostring(select(i, ...)) end
-  wezterm.log_error(table.concat(parts, ' '))
-end
-
--- wezterm.GLOBAL.X reads return a *snapshot* of the underlying table — writes
--- to a cached local do NOT propagate. So we never cache; every mutation goes
--- through wezterm.GLOBAL.line_time directly, which IS proxied for writes
--- (since wezterm 20230320-124340).
--- Also: wezterm.GLOBAL is JSON-like, so nested-table keys must be strings.
--- pane_id() returns a number → always stringify before indexing.
+-- wezterm.GLOBAL gotchas (verified empirically against 20240203):
+--   1. `local t = wezterm.GLOBAL.X; t.Y = Z` does NOT propagate — reads return
+--      a snapshot. Always mutate through `wezterm.GLOBAL.line_time.X` directly.
+--   2. The store is JSON-like: nested-table keys must be strings. pane_id()
+--      returns a number → stringify via k() before indexing.
 local function init_state()
   if wezterm.GLOBAL.line_time == nil then
     wezterm.GLOBAL.line_time = {
@@ -57,45 +49,21 @@ end
 
 local function open_gutter(main_pane)
   local id = k(main_pane:pane_id())
-  dbg('open_gutter pane=', id)
-  if wezterm.GLOBAL.line_time.gutter[id] then
-    dbg('open_gutter pane=', id, 'already has gutter, skip')
-    return
-  end
-  local ok, gutter_or_err = pcall(function()
-    return main_pane:split {
-      direction = 'Right', size = GUTTER_WIDTH, args = GUTTER_CMD,
-    }
-  end)
-  if not ok then
-    dbg('open_gutter pane=', id, 'SPLIT FAILED:', gutter_or_err)
-    return
-  end
-  if not gutter_or_err then
-    dbg('open_gutter pane=', id, 'SPLIT returned nil')
-    return
-  end
-  local gid = gutter_or_err:pane_id()
-  dbg('open_gutter pane=', id, 'split ok, gutter_pane=', gid)
-  wezterm.GLOBAL.line_time.gutter[id] = gid
+  if wezterm.GLOBAL.line_time.gutter[id] then return end
+  local gutter = main_pane:split {
+    direction = 'Right', size = GUTTER_WIDTH, args = GUTTER_CMD,
+  }
+  wezterm.GLOBAL.line_time.gutter[id] = gutter:pane_id()
   wezterm.GLOBAL.line_time.stamps[id] = {}
   wezterm.GLOBAL.line_time.last_count[id] = 0
 end
 
 local function close_gutter(main_id)
-  -- main_id may arrive as number (from is_gutter caller) or string (from
-  -- pairs() iteration over GLOBAL table). Normalise.
   local key = k(main_id)
   local gid = wezterm.GLOBAL.line_time.gutter[key]
-  dbg('close_gutter main_id=', key, 'gutter_id=', gid)
   if not gid then return end
   local gpane = wezterm.mux.get_pane(gid)
-  if gpane then
-    local ok, err = pcall(function() gpane:send_text '\x03' end)
-    if not ok then dbg('close_gutter send_text failed:', err) end
-  else
-    dbg('close_gutter: gutter pane', gid, 'not found in mux')
-  end
+  if gpane then gpane:send_text '\x03' end
   wezterm.GLOBAL.line_time.gutter[key] = nil
   wezterm.GLOBAL.line_time.stamps[key] = nil
   wezterm.GLOBAL.line_time.last_count[key] = nil
@@ -128,62 +96,37 @@ local function render_gutter(main_pane, gutter_pane)
 end
 
 local function each_main_pane(fn)
-  local nwin = 0
-  local npanes = 0
   for _, mux_win in ipairs(wezterm.mux.all_windows()) do
-    nwin = nwin + 1
     for _, tab in ipairs(mux_win:tabs()) do
       for _, pane in ipairs(tab:panes()) do
-        if not is_gutter(pane:pane_id()) then
-          npanes = npanes + 1
-          fn(pane)
-        end
+        if not is_gutter(pane:pane_id()) then fn(pane) end
       end
     end
   end
-  dbg('each_main_pane visited windows=', nwin, 'main_panes=', npanes)
 end
 
-local function instrument_all()
-  dbg('instrument_all')
-  each_main_pane(open_gutter)
-end
+local function instrument_all() each_main_pane(open_gutter) end
 
 local function teardown_all()
-  dbg('teardown_all')
   for main_id in pairs(wezterm.GLOBAL.line_time.gutter) do close_gutter(main_id) end
 end
 
 local function tick()
   if not wezterm.GLOBAL.line_time then return end
   if not wezterm.GLOBAL.line_time.enabled then return end
-  dbg('tick: enabled=true, entering each_main_pane')
   each_main_pane(function(pane)
-    local pid = k(pane:pane_id())
-    local gid = wezterm.GLOBAL.line_time.gutter[pid]
+    local gid = wezterm.GLOBAL.line_time.gutter[k(pane:pane_id())]
     local gpane = gid and wezterm.mux.get_pane(gid)
-    dbg('tick pane=', pid, 'gid=', gid, 'gpane=', gpane and 'present' or 'nil')
     if not gpane then return end
-    local rcok, rcerr = pcall(record_new_lines, pane)
-    if not rcok then dbg('record_new_lines failed:', rcerr) return end
-    local rok, rerr = pcall(render_gutter, pane, gpane)
-    if not rok then dbg('render_gutter failed:', rerr) end
+    record_new_lines(pane)
+    render_gutter(pane, gpane)
   end)
 end
 
 local function toggle()
   init_state()
-  local before = wezterm.GLOBAL.line_time.enabled
-  wezterm.GLOBAL.line_time.enabled = not before
-  local after = wezterm.GLOBAL.line_time.enabled
-  dbg('toggle before=', before, 'after=', after)
-  local ok, err
-  if after then
-    ok, err = pcall(instrument_all)
-  else
-    ok, err = pcall(teardown_all)
-  end
-  if not ok then dbg('toggle FAILED:', err) end
+  wezterm.GLOBAL.line_time.enabled = not wezterm.GLOBAL.line_time.enabled
+  if wezterm.GLOBAL.line_time.enabled then instrument_all() else teardown_all() end
 end
 
 local M = {}
@@ -191,16 +134,13 @@ local M = {}
 ---@param config table   wezterm config table being built
 ---@param opts? table    reserved for future options
 function M.apply_to_config(config, opts)
-  dbg('apply_to_config called')
   init_state()
   config.keys = config.keys or {}
   table.insert(config.keys, {
     key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
   })
   -- wezterm.on is per-Lua-VM. Each config reload (including validation
-  -- threads) gets a fresh VM with no prior handlers, so register every time.
-  -- Cross-VM dedup via wezterm.GLOBAL is wrong — it would block the main
-  -- GUI VM from registering after a validation thread set the flag.
+  -- threads) gets a fresh VM with no prior handlers — register every time.
   wezterm.on('update-status', tick)
 end
 
