@@ -73,11 +73,22 @@ end
 
 local function k(pane_id) return tostring(pane_id) end
 
+-- wezterm.GLOBAL serializes values to JSON, so a number written into a
+-- nested table can come back as a string. Comparing through tostring here
+-- means it doesn't matter which side is which type — without this guard
+-- is_gutter silently misses freshly-created gutter panes and the next tick
+-- treats them as new main panes, splitting them again → infinite cascade.
 local function is_gutter(pane_id)
+  local target = tostring(pane_id)
   for _, gid in pairs(wezterm.GLOBAL.line_time.gutter) do
-    if gid == pane_id then return true end
+    if tostring(gid) == target then return true end
   end
   return false
+end
+
+local function gid_of(main_key)
+  local gid = wezterm.GLOBAL.line_time.gutter[main_key]
+  return gid and tonumber(gid) or nil
 end
 
 local function count_lines(text)
@@ -136,7 +147,7 @@ end
 -- window, regardless of which one's update-status fired.
 local function close_gutter(main_id)
   local key = k(main_id)
-  local gid = wezterm.GLOBAL.line_time.gutter[key]
+  local gid = gid_of(key)
   if not gid then return end
   local gpane = wezterm.mux.get_pane(gid)
   if gpane then
@@ -248,7 +259,8 @@ local function tick()
       open_gutter(pane)
       return
     end
-    local gpane = wezterm.mux.get_pane(wezterm.GLOBAL.line_time.gutter[id])
+    local gid = gid_of(id)
+    local gpane = gid and wezterm.mux.get_pane(gid)
     if not gpane then return end
     record_new_lines(pane)
     render_gutter(pane, gpane)
@@ -276,7 +288,7 @@ local function on_scroll(delta_fn)
     if not enabled or not wezterm.GLOBAL.line_time then return end
     if is_gutter(pane:pane_id()) then return end
     local id = k(pane:pane_id())
-    local gid = wezterm.GLOBAL.line_time.gutter[id]
+    local gid = gid_of(id)
     if not gid then return end
     local total = wezterm.GLOBAL.line_time.last_count[id] or 0
     local cur = effective_top(id, total, viewport)
@@ -295,9 +307,38 @@ local M = {}
 
 ---@param config table   wezterm config table being built
 ---@param opts? table    reserved for future options
+-- One-shot prune at first apply_to_config in this VM. wezterm.GLOBAL outlives
+-- config reloads (and may outlive Cmd+Q via the mux server / validation VMs),
+-- so stale entries pointing at dead pane ids accumulate across sessions.
+-- Also: with the old buggy is_gutter, gutter panes themselves got recorded
+-- as "main" keys — purge those too so they stop hogging slots and prevent
+-- their real-main siblings from being processed correctly.
+local pruned_once = false
+local function prune_stale_state()
+  if pruned_once then return end
+  pruned_once = true
+  if not wezterm.GLOBAL.line_time then return end
+  for key, gid in pairs(wezterm.GLOBAL.line_time.gutter) do
+    local main_pid = tonumber(key)
+    local gpid = tonumber(gid)
+    local main_alive = main_pid and wezterm.mux.get_pane(main_pid)
+    local gutter_alive = gpid and wezterm.mux.get_pane(gpid)
+    -- main_pid being a gutter in disguise = the key is in the values set
+    local main_is_gutter = main_pid and is_gutter(main_pid)
+    if not main_alive or not gutter_alive or main_is_gutter then
+      dlog('prune: drop main_key=' .. tostring(key) .. ' gid=' .. tostring(gid))
+      wezterm.GLOBAL.line_time.gutter[key] = nil
+      wezterm.GLOBAL.line_time.stamps[key] = nil
+      wezterm.GLOBAL.line_time.last_count[key] = nil
+      wezterm.GLOBAL.line_time.viewport_top[key] = nil
+    end
+  end
+end
+
 function M.apply_to_config(config, opts)
   dlog('apply_to_config: entered')
   init_state()
+  prune_stale_state()
   dlog('apply_to_config: state initialised, enabled=' .. tostring(enabled))
   config.keys = config.keys or {}
   table.insert(config.keys, {
