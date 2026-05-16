@@ -26,15 +26,20 @@ local function dbg(...)
   wezterm.log_error(table.concat(parts, ' '))
 end
 
-local function state()
-  wezterm.GLOBAL.line_time = wezterm.GLOBAL.line_time or {
-    enabled = false, gutter = {}, stamps = {}, last_count = {},
-  }
-  return wezterm.GLOBAL.line_time
+-- wezterm.GLOBAL.X reads return a *snapshot* of the underlying table — writes
+-- to a cached local do NOT propagate. So we never cache; every mutation goes
+-- through wezterm.GLOBAL.line_time directly, which IS proxied for writes
+-- (since wezterm 20230320-124340).
+local function init_state()
+  if wezterm.GLOBAL.line_time == nil then
+    wezterm.GLOBAL.line_time = {
+      enabled = false, gutter = {}, stamps = {}, last_count = {},
+    }
+  end
 end
 
 local function is_gutter(pane_id)
-  for _, gid in pairs(state().gutter) do
+  for _, gid in pairs(wezterm.GLOBAL.line_time.gutter) do
     if gid == pane_id then return true end
   end
   return false
@@ -49,7 +54,7 @@ end
 local function open_gutter(main_pane)
   local id = main_pane:pane_id()
   dbg('open_gutter pane=', id)
-  if state().gutter[id] then
+  if wezterm.GLOBAL.line_time.gutter[id] then
     dbg('open_gutter pane=', id, 'already has gutter, skip')
     return
   end
@@ -68,13 +73,13 @@ local function open_gutter(main_pane)
   end
   local gid = gutter_or_err:pane_id()
   dbg('open_gutter pane=', id, 'split ok, gutter_pane=', gid)
-  state().gutter[id] = gid
-  state().stamps[id] = {}
-  state().last_count[id] = 0
+  wezterm.GLOBAL.line_time.gutter[id] = gid
+  wezterm.GLOBAL.line_time.stamps[id] = {}
+  wezterm.GLOBAL.line_time.last_count[id] = 0
 end
 
 local function close_gutter(main_id)
-  local gid = state().gutter[main_id]
+  local gid = wezterm.GLOBAL.line_time.gutter[main_id]
   dbg('close_gutter main_id=', main_id, 'gutter_id=', gid)
   if not gid then return end
   local gpane = wezterm.mux.get_pane(gid)
@@ -84,9 +89,9 @@ local function close_gutter(main_id)
   else
     dbg('close_gutter: gutter pane', gid, 'not found in mux')
   end
-  state().gutter[main_id] = nil
-  state().stamps[main_id] = nil
-  state().last_count[main_id] = nil
+  wezterm.GLOBAL.line_time.gutter[main_id] = nil
+  wezterm.GLOBAL.line_time.stamps[main_id] = nil
+  wezterm.GLOBAL.line_time.last_count[main_id] = nil
 end
 
 local function record_new_lines(main_pane)
@@ -94,21 +99,23 @@ local function record_new_lines(main_pane)
   local dims = main_pane:get_dimensions()
   local text = main_pane:get_logical_lines_as_text(dims.scrollback_rows)
   local count = count_lines(text)
-  local prev = state().last_count[id] or 0
+  local prev = wezterm.GLOBAL.line_time.last_count[id] or 0
   if count <= prev then return end
   local now = os.date '%H:%M:%S'
-  for i = prev + 1, count do state().stamps[id][i] = now end
-  state().last_count[id] = count
+  for i = prev + 1, count do
+    wezterm.GLOBAL.line_time.stamps[id][i] = now
+  end
+  wezterm.GLOBAL.line_time.last_count[id] = count
 end
 
 local function render_gutter(main_pane, gutter_pane)
   local id = main_pane:pane_id()
-  local total = state().last_count[id] or 0
+  local total = wezterm.GLOBAL.line_time.last_count[id] or 0
   local viewport = main_pane:get_dimensions().viewport_rows
   local first = math.max(1, total - viewport + 1)
   local lines = {}
   for i = first, total do
-    lines[#lines + 1] = state().stamps[id][i] or ''
+    lines[#lines + 1] = wezterm.GLOBAL.line_time.stamps[id][i] or ''
   end
   gutter_pane:inject_output(CLEAR_HOME .. table.concat(lines, '\r\n'))
 end
@@ -137,13 +144,14 @@ end
 
 local function teardown_all()
   dbg('teardown_all')
-  for main_id in pairs(state().gutter) do close_gutter(main_id) end
+  for main_id in pairs(wezterm.GLOBAL.line_time.gutter) do close_gutter(main_id) end
 end
 
 local function tick()
-  if not state().enabled then return end
+  if not wezterm.GLOBAL.line_time then return end
+  if not wezterm.GLOBAL.line_time.enabled then return end
   each_main_pane(function(pane)
-    local gid = state().gutter[pane:pane_id()]
+    local gid = wezterm.GLOBAL.line_time.gutter[pane:pane_id()]
     local gpane = gid and wezterm.mux.get_pane(gid)
     if not gpane then return end
     record_new_lines(pane)
@@ -152,10 +160,13 @@ local function tick()
 end
 
 local function toggle()
-  state().enabled = not state().enabled
-  dbg('toggle pressed, enabled=', state().enabled)
+  init_state()
+  local before = wezterm.GLOBAL.line_time.enabled
+  wezterm.GLOBAL.line_time.enabled = not before
+  local after = wezterm.GLOBAL.line_time.enabled
+  dbg('toggle before=', before, 'after=', after)
   local ok, err
-  if state().enabled then
+  if after then
     ok, err = pcall(instrument_all)
   else
     ok, err = pcall(teardown_all)
@@ -169,11 +180,25 @@ local M = {}
 ---@param opts? table    reserved for future options
 function M.apply_to_config(config, opts)
   dbg('apply_to_config called')
+  init_state()
   config.keys = config.keys or {}
-  table.insert(config.keys, {
-    key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
-  })
-  wezterm.on('update-status', tick)
+  -- Idempotent: each config reload re-runs apply_to_config (sometimes many
+  -- times per reload across validation threads). Avoid stacking duplicate
+  -- Cmd+E entries inside the same config.keys list.
+  local bound = false
+  for _, k in ipairs(config.keys) do
+    if k.key == 'e' and k.mods == 'CMD' then bound = true break end
+  end
+  if not bound then
+    table.insert(config.keys, {
+      key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
+    })
+  end
+  -- wezterm.on accumulates handlers across reloads; guard with a GLOBAL flag.
+  if not wezterm.GLOBAL.line_time_hooked then
+    wezterm.GLOBAL.line_time_hooked = true
+    wezterm.on('update-status', tick)
+  end
 end
 
 return M
