@@ -1,10 +1,11 @@
 --[[
 line_time — WezTerm plugin: per-line timestamp gutter on the right of each pane.
 
-Toggle: Cmd+E (global; affects all panes in all windows).
+Enabled by default on first launch; Cmd+E toggles off/on (global — affects all
+panes in all windows). State is persisted in wezterm.GLOBAL, so an explicit
+toggle-off survives config reloads.
 
 v0 limitations (see CLAUDE.md and README):
-  * panes opened while enabled get no gutter until toggle off/on
   * timestamp resolution = update-status tick (~1s); bursts share a stamp
   * unix-only: gutter child is `sleep`
   * `inject_output` does not work on multiplexer (remote) panes
@@ -40,7 +41,7 @@ local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
 -- to that row even as new content arrives below.
 local function init_state()
   if wezterm.GLOBAL.line_time == nil then wezterm.GLOBAL.line_time = {} end
-  if wezterm.GLOBAL.line_time.enabled == nil then wezterm.GLOBAL.line_time.enabled = false end
+  if wezterm.GLOBAL.line_time.enabled == nil then wezterm.GLOBAL.line_time.enabled = true end
   if wezterm.GLOBAL.line_time.gutter == nil then wezterm.GLOBAL.line_time.gutter = {} end
   if wezterm.GLOBAL.line_time.stamps == nil then wezterm.GLOBAL.line_time.stamps = {} end
   if wezterm.GLOBAL.line_time.last_count == nil then wezterm.GLOBAL.line_time.last_count = {} end
@@ -145,12 +146,23 @@ local function teardown_all()
   for main_id in pairs(wezterm.GLOBAL.line_time.gutter) do close_gutter(main_id) end
 end
 
+-- Lazy-opens the gutter for any main pane that doesn't have one yet. This is
+-- how the plugin becomes visible on a fresh process (enabled=true by default
+-- but apply_to_config runs before mux has any windows — only update-status
+-- sees real panes) and how panes spawned later acquire a gutter without a
+-- toggle off/on dance. A stale gid (user closed the gutter pane manually) is
+-- left alone — open_gutter is no-op when gid is present, regardless of
+-- whether the underlying mux pane is still alive.
 local function tick()
   if not wezterm.GLOBAL.line_time then return end
   if not wezterm.GLOBAL.line_time.enabled then return end
   each_main_pane(function(pane)
-    local gid = wezterm.GLOBAL.line_time.gutter[k(pane:pane_id())]
-    local gpane = gid and wezterm.mux.get_pane(gid)
+    local id = k(pane:pane_id())
+    if not wezterm.GLOBAL.line_time.gutter[id] then
+      open_gutter(pane)
+      return
+    end
+    local gpane = wezterm.mux.get_pane(wezterm.GLOBAL.line_time.gutter[id])
     if not gpane then return end
     record_new_lines(pane)
     render_gutter(pane, gpane)
