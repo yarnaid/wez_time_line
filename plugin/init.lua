@@ -19,6 +19,13 @@ local GUTTER_WIDTH = 10
 local GUTTER_CMD = { 'sleep', '2147483647' }
 local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
 
+-- DIAG: temporary diagnostics. log_error is always written to the gui log.
+local function dbg(...)
+  local parts = { '[line_time]' }
+  for i = 1, select('#', ...) do parts[#parts + 1] = tostring(select(i, ...)) end
+  wezterm.log_error(table.concat(parts, ' '))
+end
+
 local function state()
   wezterm.GLOBAL.line_time = wezterm.GLOBAL.line_time or {
     enabled = false, gutter = {}, stamps = {}, last_count = {},
@@ -41,20 +48,42 @@ end
 
 local function open_gutter(main_pane)
   local id = main_pane:pane_id()
-  if state().gutter[id] then return end
-  local gutter = main_pane:split {
-    direction = 'Right', size = GUTTER_WIDTH, args = GUTTER_CMD,
-  }
-  state().gutter[id] = gutter:pane_id()
+  dbg('open_gutter pane=', id)
+  if state().gutter[id] then
+    dbg('open_gutter pane=', id, 'already has gutter, skip')
+    return
+  end
+  local ok, gutter_or_err = pcall(function()
+    return main_pane:split {
+      direction = 'Right', size = GUTTER_WIDTH, args = GUTTER_CMD,
+    }
+  end)
+  if not ok then
+    dbg('open_gutter pane=', id, 'SPLIT FAILED:', gutter_or_err)
+    return
+  end
+  if not gutter_or_err then
+    dbg('open_gutter pane=', id, 'SPLIT returned nil')
+    return
+  end
+  local gid = gutter_or_err:pane_id()
+  dbg('open_gutter pane=', id, 'split ok, gutter_pane=', gid)
+  state().gutter[id] = gid
   state().stamps[id] = {}
   state().last_count[id] = 0
 end
 
 local function close_gutter(main_id)
   local gid = state().gutter[main_id]
+  dbg('close_gutter main_id=', main_id, 'gutter_id=', gid)
   if not gid then return end
   local gpane = wezterm.mux.get_pane(gid)
-  if gpane then gpane:send_text '\x03' end
+  if gpane then
+    local ok, err = pcall(function() gpane:send_text '\x03' end)
+    if not ok then dbg('close_gutter send_text failed:', err) end
+  else
+    dbg('close_gutter: gutter pane', gid, 'not found in mux')
+  end
   state().gutter[main_id] = nil
   state().stamps[main_id] = nil
   state().last_count[main_id] = nil
@@ -85,18 +114,29 @@ local function render_gutter(main_pane, gutter_pane)
 end
 
 local function each_main_pane(fn)
+  local nwin = 0
+  local npanes = 0
   for _, mux_win in ipairs(wezterm.mux.all_windows()) do
+    nwin = nwin + 1
     for _, tab in ipairs(mux_win:tabs()) do
       for _, pane in ipairs(tab:panes()) do
-        if not is_gutter(pane:pane_id()) then fn(pane) end
+        if not is_gutter(pane:pane_id()) then
+          npanes = npanes + 1
+          fn(pane)
+        end
       end
     end
   end
+  dbg('each_main_pane visited windows=', nwin, 'main_panes=', npanes)
 end
 
-local function instrument_all()  each_main_pane(open_gutter) end
+local function instrument_all()
+  dbg('instrument_all')
+  each_main_pane(open_gutter)
+end
 
 local function teardown_all()
+  dbg('teardown_all')
   for main_id in pairs(state().gutter) do close_gutter(main_id) end
 end
 
@@ -113,7 +153,14 @@ end
 
 local function toggle()
   state().enabled = not state().enabled
-  if state().enabled then instrument_all() else teardown_all() end
+  dbg('toggle pressed, enabled=', state().enabled)
+  local ok, err
+  if state().enabled then
+    ok, err = pcall(instrument_all)
+  else
+    ok, err = pcall(teardown_all)
+  end
+  if not ok then dbg('toggle FAILED:', err) end
 end
 
 local M = {}
@@ -121,6 +168,7 @@ local M = {}
 ---@param config table   wezterm config table being built
 ---@param opts? table    reserved for future options
 function M.apply_to_config(config, opts)
+  dbg('apply_to_config called')
   config.keys = config.keys or {}
   table.insert(config.keys, {
     key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
