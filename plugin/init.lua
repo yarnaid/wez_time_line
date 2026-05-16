@@ -61,6 +61,10 @@ local gutters = {}        -- [main_id (number)] = gutter_id (number)
 local stamps = {}         -- [main_id] = { [row_index_str] = "HH:MM:SS" }
 local last_count = {}     -- [main_id] = number of logical lines seen so far
 local viewport_top = {}   -- [main_id] = pinned top row (0 = follow live tail)
+-- Tracks whether we've ever observed a foreground process in the main pane.
+-- Used to distinguish "shell still booting, no process yet" (don't reap) from
+-- "shell exited but exit_behavior=Hold is keeping the pane around" (do reap).
+local proc_seen = {}      -- [main_id] = true once we've seen any fg process
 
 local function count_lines(text)
   local n = 0
@@ -128,6 +132,7 @@ local function clear_state(main_id)
   stamps[main_id] = nil
   last_count[main_id] = nil
   viewport_top[main_id] = nil
+  proc_seen[main_id] = nil
 end
 
 local function open_gutter(main_pane)
@@ -157,7 +162,11 @@ local function open_gutter(main_pane)
   gutters[id] = gutter:pane_id()
   set_stub_state(id)
   if prev_active and prev_active:pane_id() ~= gutter:pane_id() then
-    pcall(function() prev_active:activate() end)
+    local ok, err = pcall(function() prev_active:activate() end)
+    local active_after = tab and tab:active_pane()
+    dlog('focus_restore: target=' .. tostring(prev_active:pane_id())
+      .. ' ok=' .. tostring(ok) .. ' err=' .. tostring(err)
+      .. ' active_after=' .. tostring(active_after and active_after:pane_id()))
   end
 end
 
@@ -243,15 +252,35 @@ local function teardown_all()
   for main_id in pairs(gutters) do close_gutter(main_id) end
 end
 
--- Sweep mapping for entries whose main pane has died (Ctrl+D, manual close,
--- etc). The sibling gutter is still alive in mux but now orphaned — kill it
--- so the tab/window can close in turn. Worst-case latency ≤ 1 tick.
+-- Sweep mapping for entries whose main pane has died. Two cases:
+--   1. mux.get_pane(main_id) returns nil — pane was removed from the mux
+--      (default exit_behavior closes the pane on shell exit).
+--   2. main pane is still in mux but `get_foreground_process_info()` returns
+--      nil after we've previously seen a process there — shell exited and
+--      exit_behavior = "Hold" / "CloseOnCleanExit" is keeping the pane in a
+--      "process gone" state. User pressed Ctrl+D expecting close; honour that.
+-- For case 2 we also force-kill the held main pane via kill_pane, since
+-- otherwise the tab survives with a zombie [Process exited] view.
 local function reap_orphan_gutters()
-  local dead = {}
+  local to_kill = {}
   for main_id in pairs(gutters) do
-    if not wezterm.mux.get_pane(main_id) then dead[#dead + 1] = main_id end
+    local mp = wezterm.mux.get_pane(main_id)
+    if not mp then
+      to_kill[#to_kill + 1] = { main_id = main_id, mp = nil }
+    else
+      local proc = mp:get_foreground_process_info()
+      if proc then
+        proc_seen[main_id] = true
+      elseif proc_seen[main_id] then
+        dlog('reap: main ' .. tostring(main_id) .. ' shell exited (exit_behavior=Hold?), force-killing')
+        to_kill[#to_kill + 1] = { main_id = main_id, mp = mp }
+      end
+    end
   end
-  for _, main_id in ipairs(dead) do close_gutter(main_id) end
+  for _, item in ipairs(to_kill) do
+    close_gutter(item.main_id)
+    if item.mp then kill_pane(item.mp) end
+  end
 end
 
 -- Find gutter panes that aren't claimed by any main in our mapping (e.g.
