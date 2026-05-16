@@ -313,10 +313,30 @@ local function reap_unclaimed_gutters()
   end
 end
 
+local tick_n = 0
 local function tick()
+  tick_n = tick_n + 1
   if not enabled then return end
-  reap_orphan_gutters()
-  reap_unclaimed_gutters()
+  -- DIAG: heartbeat every 3rd tick, dumping mapping with liveness status.
+  -- Tells us whether tick is running at all after startup, and whether
+  -- mux/get_foreground_process_info ever flips for a Ctrl+D'd pane.
+  if tick_n % 3 == 0 then
+    local entries = {}
+    for k, v in pairs(gutters) do
+      local mp = wezterm.mux.get_pane(k)
+      local proc = mp and mp:get_foreground_process_info()
+      entries[#entries + 1] = string.format(
+        '%s=>%s(mux=%s,proc=%s)',
+        tostring(k), tostring(v),
+        tostring(mp ~= nil), tostring(proc ~= nil)
+      )
+    end
+    dlog('tick ' .. tostring(tick_n) .. ' map=[' .. table.concat(entries, ',') .. ']')
+  end
+  local ok, err = pcall(reap_orphan_gutters)
+  if not ok then dlog('reap_orphan threw: ' .. tostring(err)) end
+  ok, err = pcall(reap_unclaimed_gutters)
+  if not ok then dlog('reap_unclaimed threw: ' .. tostring(err)) end
   each_main_pane(function(pane)
     local id = pane:pane_id()
     if not gutters[id] then
