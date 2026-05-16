@@ -52,9 +52,19 @@ end
 -- viewport_top[pid] = row index of the topmost visible row in the main pane.
 -- Absent/0 means "follow the live tail"; a positive number pins the gutter
 -- to that row even as new content arrives below.
+-- `enabled` is intentionally a module local, NOT a field of wezterm.GLOBAL.
+-- Storing it globally turned out to be a footgun: wezterm spawns a separate
+-- validation VM (and possibly persists GLOBAL across mux-server-backed
+-- restarts), so a once-toggled `false` would stick across what looked like
+-- a fresh launch — leaving the gutter mysteriously off on startup until
+-- the user pressed Cmd+E. Per-VM means: every new VM (GUI on first launch,
+-- new GUI on relaunch, ephemeral validation VMs) defaults to enabled=true,
+-- and only the live GUI VM's toggle changes it for itself. Validation VMs
+-- don't receive update-status events, so their stale `true` is inert.
+local enabled = true
+
 local function init_state()
   if wezterm.GLOBAL.line_time == nil then wezterm.GLOBAL.line_time = {} end
-  if wezterm.GLOBAL.line_time.enabled == nil then wezterm.GLOBAL.line_time.enabled = true end
   if wezterm.GLOBAL.line_time.gutter == nil then wezterm.GLOBAL.line_time.gutter = {} end
   if wezterm.GLOBAL.line_time.stamps == nil then wezterm.GLOBAL.line_time.stamps = {} end
   if wezterm.GLOBAL.line_time.last_count == nil then wezterm.GLOBAL.line_time.last_count = {} end
@@ -222,7 +232,7 @@ local function tick()
     dlog('tick: no state')
     return
   end
-  if not wezterm.GLOBAL.line_time.enabled then
+  if not enabled then
     dlog('tick: disabled')
     return
   end
@@ -248,9 +258,9 @@ end
 
 local function toggle()
   init_state()
-  wezterm.GLOBAL.line_time.enabled = not wezterm.GLOBAL.line_time.enabled
-  dlog('toggle: enabled=' .. tostring(wezterm.GLOBAL.line_time.enabled))
-  if wezterm.GLOBAL.line_time.enabled then instrument_all() else teardown_all() end
+  enabled = not enabled
+  dlog('toggle: enabled=' .. tostring(enabled))
+  if enabled then instrument_all() else teardown_all() end
 end
 
 -- Wraps a scroll action so the gutter's viewport_top tracks the main pane's
@@ -263,7 +273,7 @@ local function on_scroll(delta_fn)
     local viewport = pane:get_dimensions().viewport_rows
     local delta = delta_fn(viewport)
     window:perform_action(act.ScrollByLine(delta), pane)
-    if not wezterm.GLOBAL.line_time or not wezterm.GLOBAL.line_time.enabled then return end
+    if not enabled or not wezterm.GLOBAL.line_time then return end
     if is_gutter(pane:pane_id()) then return end
     local id = k(pane:pane_id())
     local gid = wezterm.GLOBAL.line_time.gutter[id]
@@ -288,7 +298,7 @@ local M = {}
 function M.apply_to_config(config, opts)
   dlog('apply_to_config: entered')
   init_state()
-  dlog('apply_to_config: state initialised, enabled=' .. tostring(wezterm.GLOBAL.line_time.enabled))
+  dlog('apply_to_config: state initialised, enabled=' .. tostring(enabled))
   config.keys = config.keys or {}
   table.insert(config.keys, {
     key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
