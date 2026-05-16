@@ -157,12 +157,17 @@ end
 local function tick()
   if not wezterm.GLOBAL.line_time then return end
   if not wezterm.GLOBAL.line_time.enabled then return end
+  dbg('tick: enabled=true, entering each_main_pane')
   each_main_pane(function(pane)
-    local gid = wezterm.GLOBAL.line_time.gutter[k(pane:pane_id())]
+    local pid = k(pane:pane_id())
+    local gid = wezterm.GLOBAL.line_time.gutter[pid]
     local gpane = gid and wezterm.mux.get_pane(gid)
+    dbg('tick pane=', pid, 'gid=', gid, 'gpane=', gpane and 'present' or 'nil')
     if not gpane then return end
-    record_new_lines(pane)
-    render_gutter(pane, gpane)
+    local rcok, rcerr = pcall(record_new_lines, pane)
+    if not rcok then dbg('record_new_lines failed:', rcerr) return end
+    local rok, rerr = pcall(render_gutter, pane, gpane)
+    if not rok then dbg('render_gutter failed:', rerr) end
   end)
 end
 
@@ -189,23 +194,14 @@ function M.apply_to_config(config, opts)
   dbg('apply_to_config called')
   init_state()
   config.keys = config.keys or {}
-  -- Idempotent: each config reload re-runs apply_to_config (sometimes many
-  -- times per reload across validation threads). Avoid stacking duplicate
-  -- Cmd+E entries inside the same config.keys list.
-  local bound = false
-  for _, entry in ipairs(config.keys) do
-    if entry.key == 'e' and entry.mods == 'CMD' then bound = true break end
-  end
-  if not bound then
-    table.insert(config.keys, {
-      key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
-    })
-  end
-  -- wezterm.on accumulates handlers across reloads; guard with a GLOBAL flag.
-  if not wezterm.GLOBAL.line_time_hooked then
-    wezterm.GLOBAL.line_time_hooked = true
-    wezterm.on('update-status', tick)
-  end
+  table.insert(config.keys, {
+    key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
+  })
+  -- wezterm.on is per-Lua-VM. Each config reload (including validation
+  -- threads) gets a fresh VM with no prior handlers, so register every time.
+  -- Cross-VM dedup via wezterm.GLOBAL is wrong — it would block the main
+  -- GUI VM from registering after a validation thread set the flag.
+  wezterm.on('update-status', tick)
 end
 
 return M
