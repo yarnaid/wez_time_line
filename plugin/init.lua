@@ -31,18 +31,6 @@ local CLOSE_PANE = wezterm.action.CloseCurrentPane { confirm = false }
 local GUTTER_USER_VAR = 'line_time_gutter'
 local MARK_GUTTER_OSC = '\x1b]1337;SetUserVar=' .. GUTTER_USER_VAR .. '=MQ==\x07'
 
--- DIAGNOSTIC: writes to /tmp/line_time.log unconditionally so we bypass any
--- ambiguity about where wezterm.log_warn ends up. `tail -F /tmp/line_time.log`
--- to watch live. Will be removed in a follow-up once we've confirmed stability.
-local DEBUG_LOG_PATH = '/tmp/line_time.log'
-local function dlog(msg)
-  local f = io.open(DEBUG_LOG_PATH, 'a')
-  if f then
-    f:write(os.date('%H:%M:%S ') .. msg .. '\n')
-    f:close()
-  end
-end
-
 -- All mutable state lives as module locals, NOT in wezterm.GLOBAL.
 --
 -- wezterm.GLOBAL turned out to be a footgun: it wraps stored values in an
@@ -154,12 +142,10 @@ local function open_gutter(main_pane)
   -- from before the VM restart), adopt it instead of spawning a new one.
   local existing = find_sibling_gutter(main_pane)
   if existing then
-    dlog('reclaim: main=' .. tostring(id) .. ' gutter=' .. tostring(existing:pane_id()))
     gutters[id] = existing:pane_id()
     set_stub_state(id)
     return
   end
-  dlog('open_gutter: pane ' .. tostring(id))
   -- pane:split focuses the new pane. Remember the tab's active pane first so
   -- we can hand focus back — otherwise a lazy-open from update-status yanks
   -- the cursor into the gutter.
@@ -174,11 +160,7 @@ local function open_gutter(main_pane)
   gutters[id] = gutter:pane_id()
   set_stub_state(id)
   if prev_active and prev_active:pane_id() ~= gutter:pane_id() then
-    local ok, err = pcall(function() prev_active:activate() end)
-    local active_after = tab and tab:active_pane()
-    dlog('focus_restore: target=' .. tostring(prev_active:pane_id())
-      .. ' ok=' .. tostring(ok) .. ' err=' .. tostring(err)
-      .. ' active_after=' .. tostring(active_after and active_after:pane_id()))
+    pcall(function() prev_active:activate() end)
   end
 end
 
@@ -191,11 +173,10 @@ end
 -- talks straight to the mux server. Firing both is idempotent and self-heals.
 local WEZTERM_BIN = wezterm.executable_dir .. '/wezterm'
 local function kill_pane(gpane)
-  if not gpane then dlog('kill_pane: nil gpane'); return end
+  if not gpane then return end
   local pid = gpane:pane_id()
   local mux_win = gpane:window()
   local gui_win = mux_win and mux_win:gui_window()
-  dlog('kill_pane ' .. tostring(pid) .. ': mux_win=' .. tostring(mux_win ~= nil) .. ' gui_win=' .. tostring(gui_win ~= nil))
   if gui_win then
     pcall(function() gui_win:perform_action(CLOSE_PANE, gpane) end)
   end
@@ -247,12 +228,7 @@ local function each_main_pane(fn)
   for _, mux_win in ipairs(wezterm.mux.all_windows()) do
     for _, tab in ipairs(mux_win:tabs()) do
       for _, pane in ipairs(tab:panes()) do
-        if not is_gutter(pane) then
-          local ok, err = pcall(fn, pane)
-          if not ok then
-            dlog('each_main_pane: pane ' .. tostring(pane:pane_id()) .. ' failed: ' .. tostring(err))
-          end
-        end
+        if not is_gutter(pane) then pcall(fn, pane) end
       end
     end
   end
@@ -284,7 +260,6 @@ local function reap_orphan_gutters()
       if proc then
         proc_seen[main_id] = true
       elseif proc_seen[main_id] then
-        dlog('reap: main ' .. tostring(main_id) .. ' shell exited (exit_behavior=Hold?), force-killing')
         to_kill[#to_kill + 1] = { main_id = main_id, mp = mp }
       end
     end
@@ -315,40 +290,17 @@ local function reap_unclaimed_gutters()
       end
       if not has_main then
         for _, pane in ipairs(panes) do
-          if is_gutter(pane) and not claimed[pane:pane_id()] then
-            dlog('reap_unclaimed: kill gutter ' .. tostring(pane:pane_id()))
-            kill_pane(pane)
-          end
+          if is_gutter(pane) and not claimed[pane:pane_id()] then kill_pane(pane) end
         end
       end
     end
   end
 end
 
-local tick_n = 0
 local function tick()
-  tick_n = tick_n + 1
   if not enabled then return end
-  -- DIAG: heartbeat every 3rd tick, dumping mapping with liveness status.
-  -- Tells us whether tick is running at all after startup, and whether
-  -- mux/get_foreground_process_info ever flips for a Ctrl+D'd pane.
-  if tick_n % 3 == 0 then
-    local entries = {}
-    for k, v in pairs(gutters) do
-      local mp = safe_get_pane(k)
-      local proc = mp and mp:get_foreground_process_info()
-      entries[#entries + 1] = string.format(
-        '%s=>%s(mux=%s,proc=%s)',
-        tostring(k), tostring(v),
-        tostring(mp ~= nil), tostring(proc ~= nil)
-      )
-    end
-    dlog('tick ' .. tostring(tick_n) .. ' map=[' .. table.concat(entries, ',') .. ']')
-  end
-  local ok, err = pcall(reap_orphan_gutters)
-  if not ok then dlog('reap_orphan threw: ' .. tostring(err)) end
-  ok, err = pcall(reap_unclaimed_gutters)
-  if not ok then dlog('reap_unclaimed threw: ' .. tostring(err)) end
+  pcall(reap_orphan_gutters)
+  pcall(reap_unclaimed_gutters)
   each_main_pane(function(pane)
     local id = pane:pane_id()
     if not gutters[id] then
@@ -369,7 +321,6 @@ end
 
 local function toggle()
   enabled = not enabled
-  dlog('toggle: enabled=' .. tostring(enabled))
   if enabled then instrument_all() else teardown_all() end
 end
 
@@ -406,7 +357,6 @@ local M = {}
 ---@param config table   wezterm config table being built
 ---@param opts? table    reserved for future options
 function M.apply_to_config(config, opts)
-  dlog('apply_to_config: entered')
   config.keys = config.keys or {}
   table.insert(config.keys, {
     key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
@@ -425,7 +375,6 @@ function M.apply_to_config(config, opts)
   -- wezterm.on is per-Lua-VM. Each config reload (including validation
   -- threads) gets a fresh VM with no prior handlers — register every time.
   wezterm.on('update-status', tick)
-  dlog('apply_to_config: update-status handler registered')
 end
 
 return M
