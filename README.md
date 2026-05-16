@@ -10,13 +10,13 @@ Toggle with **Cmd+E**.
 local wezterm = require 'wezterm'
 local config = wezterm.config_builder()
 
-local line_time = wezterm.plugin.require 'https://github.com/<owner>/line_time'
+local line_time = wezterm.plugin.require 'https://github.com/yarnaid/wez_time_line'
 line_time.apply_to_config(config)
 
 return config
 ```
 
-Replace `<owner>` with the repo's GitHub owner once published. For local development:
+For local development:
 
 ```lua
 local line_time = wezterm.plugin.require 'file:///Users/yarnaid/projects/line_time'
