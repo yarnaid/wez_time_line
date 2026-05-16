@@ -161,17 +161,28 @@ local function open_gutter(main_pane)
   end
 end
 
--- Close the gutter via the official CloseCurrentPane action — documented to
--- "shut down the PTY and kill the process", which bypasses exit_behavior.
--- We can't just `send_text '\x03'`: sleep exiting on SIGINT yields status
--- 130, and the default exit_behavior = "CloseOnCleanExit" holds the pane
--- open on non-zero exits, so the orphaned gutter would linger (full-width,
--- since its main sibling is gone) and block the tab from closing.
+-- Close the gutter both ways: CloseCurrentPane action via the gui window,
+-- AND `wezterm cli kill-pane` in the background. Either should be sufficient
+-- in isolation, but in practice one or the other has silently no-op'd
+-- depending on the surrounding state — empirically gui_window() returns nil
+-- for orphan gutter panes whose sibling main has just died, so perform_action
+-- never reaches the close path. The CLI doesn't care about gui state; it
+-- talks straight to the mux server. Firing both is idempotent and self-heals.
+local WEZTERM_BIN = wezterm.executable_dir .. '/wezterm'
 local function kill_pane(gpane)
-  if not gpane then return end
+  if not gpane then dlog('kill_pane: nil gpane'); return end
+  local pid = gpane:pane_id()
   local mux_win = gpane:window()
   local gui_win = mux_win and mux_win:gui_window()
-  if gui_win then gui_win:perform_action(CLOSE_PANE, gpane) end
+  dlog('kill_pane ' .. tostring(pid) .. ': mux_win=' .. tostring(mux_win ~= nil) .. ' gui_win=' .. tostring(gui_win ~= nil))
+  if gui_win then
+    pcall(function() gui_win:perform_action(CLOSE_PANE, gpane) end)
+  end
+  pcall(function()
+    wezterm.background_child_process {
+      WEZTERM_BIN, 'cli', 'kill-pane', '--pane-id', tostring(pid),
+    }
+  end)
 end
 
 local function close_gutter(main_id)
