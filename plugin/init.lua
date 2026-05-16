@@ -1,9 +1,9 @@
 --[[
 line_time — WezTerm plugin: per-line timestamp gutter on the right of each pane.
 
-Enabled by default on first launch; Cmd+E toggles off/on (global — affects all
-panes in all windows). State is persisted in wezterm.GLOBAL, so an explicit
-toggle-off survives config reloads.
+Enabled by default; Cmd+E toggles off/on (global — affects all panes in all
+windows). Toggle state lives in a Lua VM local (NOT wezterm.GLOBAL — see the
+`enabled` comment below), so a fresh GUI process always defaults to on.
 
 v0 limitations (see CLAUDE.md and README):
   * timestamp resolution = update-status tick (~1s); bursts share a stamp
@@ -25,9 +25,15 @@ local GUTTER_CMD = { 'sleep', '2147483647' }
 local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
 local CLOSE_PANE = wezterm.action.CloseCurrentPane { confirm = false }
 
+-- After splitting we mark the new pane with this user var via OSC 1337 so we
+-- can re-discover existing gutter panes across config reloads / VM restarts
+-- without depending on any in-memory mapping. Value is base64("1") = "MQ==".
+local GUTTER_USER_VAR = 'line_time_gutter'
+local MARK_GUTTER_OSC = '\x1b]1337;SetUserVar=' .. GUTTER_USER_VAR .. '=MQ==\x07'
+
 -- DIAGNOSTIC: writes to /tmp/line_time.log unconditionally so we bypass any
 -- ambiguity about where wezterm.log_warn ends up. `tail -F /tmp/line_time.log`
--- in another tab to watch live. Remove once we've identified the bug.
+-- to watch live. Will be removed in a follow-up once we've confirmed stability.
 local DEBUG_LOG_PATH = '/tmp/line_time.log'
 local function dlog(msg)
   local f = io.open(DEBUG_LOG_PATH, 'a')
@@ -37,59 +43,24 @@ local function dlog(msg)
   end
 end
 
--- wezterm.GLOBAL gotchas (verified empirically against 20240203):
---   1. `local t = wezterm.GLOBAL.X; t.Y = Z` does NOT propagate — reads return
---      a snapshot. Always mutate through `wezterm.GLOBAL.line_time.X` directly.
---   2. The store is JSON-like: nested-table keys must be strings. pane_id()
---      returns a number → stringify via k() before indexing.
--- Initialise each sub-table separately. wezterm.GLOBAL.line_time = {..., t={}}
--- in one assignment empirically loses the empty nested tables — they come
--- back as nil. Setting each field via wezterm.GLOBAL.line_time.X = {} works.
--- This also serves as a hot-reload backfill: if the plugin was updated via
--- wezterm.plugin.update_all() without a process restart, an older
--- line_time table (missing newer fields like viewport_top) is still in
--- wezterm.GLOBAL — fill in only the missing pieces.
--- viewport_top[pid] = row index of the topmost visible row in the main pane.
--- Absent/0 means "follow the live tail"; a positive number pins the gutter
--- to that row even as new content arrives below.
--- `enabled` is intentionally a module local, NOT a field of wezterm.GLOBAL.
--- Storing it globally turned out to be a footgun: wezterm spawns a separate
--- validation VM (and possibly persists GLOBAL across mux-server-backed
--- restarts), so a once-toggled `false` would stick across what looked like
--- a fresh launch — leaving the gutter mysteriously off on startup until
--- the user pressed Cmd+E. Per-VM means: every new VM (GUI on first launch,
--- new GUI on relaunch, ephemeral validation VMs) defaults to enabled=true,
--- and only the live GUI VM's toggle changes it for itself. Validation VMs
--- don't receive update-status events, so their stale `true` is inert.
+-- All mutable state lives as module locals, NOT in wezterm.GLOBAL.
+--
+-- wezterm.GLOBAL turned out to be a footgun: it wraps stored values in an
+-- opaque "Value" userdata on read-back (tostring gives "Value: 0x..." with no
+-- way to recover the underlying pane id), so id comparisons silently
+-- mis-fired: every freshly-created gutter was misclassified as a new main
+-- pane on the next tick, splitting it again → infinite cascade of nested
+-- gutter panes. Plain Lua tables sidestep the entire mess.
+--
+-- Cost: state doesn't survive config reload. The `reclaim_existing_gutter`
+-- pass on each tick rebuilds the mapping by scanning panes for the
+-- GUTTER_USER_VAR marker, so a reload doesn't strand existing gutters — they
+-- get re-adopted by their sibling main pane within one tick.
 local enabled = true
-
-local function init_state()
-  if wezterm.GLOBAL.line_time == nil then wezterm.GLOBAL.line_time = {} end
-  if wezterm.GLOBAL.line_time.gutter == nil then wezterm.GLOBAL.line_time.gutter = {} end
-  if wezterm.GLOBAL.line_time.stamps == nil then wezterm.GLOBAL.line_time.stamps = {} end
-  if wezterm.GLOBAL.line_time.last_count == nil then wezterm.GLOBAL.line_time.last_count = {} end
-  if wezterm.GLOBAL.line_time.viewport_top == nil then wezterm.GLOBAL.line_time.viewport_top = {} end
-end
-
-local function k(pane_id) return tostring(pane_id) end
-
--- wezterm.GLOBAL serializes values to JSON, so a number written into a
--- nested table can come back as a string. Comparing through tostring here
--- means it doesn't matter which side is which type — without this guard
--- is_gutter silently misses freshly-created gutter panes and the next tick
--- treats them as new main panes, splitting them again → infinite cascade.
-local function is_gutter(pane_id)
-  local target = tostring(pane_id)
-  for _, gid in pairs(wezterm.GLOBAL.line_time.gutter) do
-    if tostring(gid) == target then return true end
-  end
-  return false
-end
-
-local function gid_of(main_key)
-  local gid = wezterm.GLOBAL.line_time.gutter[main_key]
-  return gid and tonumber(gid) or nil
-end
+local gutters = {}        -- [main_id (number)] = gutter_id (number)
+local stamps = {}         -- [main_id] = { [row_index_str] = "HH:MM:SS" }
+local last_count = {}     -- [main_id] = number of logical lines seen so far
+local viewport_top = {}   -- [main_id] = pinned top row (0 = follow live tail)
 
 local function count_lines(text)
   local n = 0
@@ -109,27 +80,82 @@ local function clamp_top(top, total, viewport)
 end
 
 local function effective_top(id, total, viewport)
-  local pinned = wezterm.GLOBAL.line_time.viewport_top[id] or 0
+  local pinned = viewport_top[id] or 0
   if pinned == 0 then return live_tail_top(total, viewport) end
   return pinned
 end
 
+-- A pane is a gutter if either:
+--   1. Its user vars contain our marker (set by inject of MARK_GUTTER_OSC
+--      after we split it). This is the primary identity.
+--   2. Its foreground process is `sleep 2147483647`. Fallback for panes
+--      created before the user var marker was added (recovers stragglers
+--      from buggy older sessions).
+local function is_gutter(pane)
+  local vars = pane:get_user_vars()
+  if vars and vars[GUTTER_USER_VAR] == '1' then return true end
+  local proc = pane:get_foreground_process_info()
+  if proc and proc.argv and proc.argv[1]
+    and proc.argv[1]:match 'sleep$'
+    and proc.argv[2] == '2147483647'
+  then
+    return true
+  end
+  return false
+end
+
+-- For a given main pane, look at its tab's other panes and return the first
+-- that's a gutter. Used to reclaim gutter ownership across VM restarts and
+-- to avoid double-splitting if state was lost but the gutter pane survived.
+local function find_sibling_gutter(main_pane)
+  local tab = main_pane:tab()
+  if not tab then return nil end
+  local main_id = main_pane:pane_id()
+  for _, pane in ipairs(tab:panes()) do
+    if pane:pane_id() ~= main_id and is_gutter(pane) then return pane end
+  end
+  return nil
+end
+
+local function set_stub_state(main_id)
+  stamps[main_id] = stamps[main_id] or {}
+  last_count[main_id] = last_count[main_id] or 0
+  viewport_top[main_id] = viewport_top[main_id] or 0
+end
+
+local function clear_state(main_id)
+  gutters[main_id] = nil
+  stamps[main_id] = nil
+  last_count[main_id] = nil
+  viewport_top[main_id] = nil
+end
+
 local function open_gutter(main_pane)
-  local id = k(main_pane:pane_id())
-  if wezterm.GLOBAL.line_time.gutter[id] then return end
-  dlog('open_gutter: pane ' .. id)
+  local id = main_pane:pane_id()
+  if gutters[id] then return end
+  -- Re-claim across reloads: if a sibling pane is already a gutter (left over
+  -- from before the VM restart), adopt it instead of spawning a new one.
+  local existing = find_sibling_gutter(main_pane)
+  if existing then
+    dlog('reclaim: main=' .. tostring(id) .. ' gutter=' .. tostring(existing:pane_id()))
+    gutters[id] = existing:pane_id()
+    set_stub_state(id)
+    return
+  end
+  dlog('open_gutter: pane ' .. tostring(id))
   -- pane:split focuses the new pane. Remember the tab's active pane first so
-  -- we can hand focus back — otherwise a lazy-open from update-status (or a
-  -- toggle while a sibling is focused) yanks the cursor into the gutter.
+  -- we can hand focus back — otherwise a lazy-open from update-status yanks
+  -- the cursor into the gutter.
   local tab = main_pane:tab()
   local prev_active = tab and tab:active_pane()
   local gutter = main_pane:split {
     direction = 'Right', size = GUTTER_WIDTH, args = GUTTER_CMD,
   }
-  wezterm.GLOBAL.line_time.gutter[id] = gutter:pane_id()
-  wezterm.GLOBAL.line_time.stamps[id] = {}
-  wezterm.GLOBAL.line_time.last_count[id] = 0
-  wezterm.GLOBAL.line_time.viewport_top[id] = 0
+  -- Mark the new pane as ours so future ticks (and future VMs after reload)
+  -- can identify it without consulting any external mapping.
+  gutter:inject_output(MARK_GUTTER_OSC)
+  gutters[id] = gutter:pane_id()
+  set_stub_state(id)
   if prev_active and prev_active:pane_id() ~= gutter:pane_id() then
     pcall(function() prev_active:activate() end)
   end
@@ -140,49 +166,44 @@ end
 -- We can't just `send_text '\x03'`: sleep exiting on SIGINT yields status
 -- 130, and the default exit_behavior = "CloseOnCleanExit" holds the pane
 -- open on non-zero exits, so the orphaned gutter would linger (full-width,
--- since its main sibling is gone) and block the tab from closing. The CLI
--- (wezterm cli kill-pane) was an earlier attempt — turned out to no-op in
--- practice from inside background_child_process. perform_action requires a
--- GUI window; derive it from the gutter pane itself so this works for any
--- window, regardless of which one's update-status fired.
+-- since its main sibling is gone) and block the tab from closing.
+local function kill_pane(gpane)
+  if not gpane then return end
+  local mux_win = gpane:window()
+  local gui_win = mux_win and mux_win:gui_window()
+  if gui_win then gui_win:perform_action(CLOSE_PANE, gpane) end
+end
+
 local function close_gutter(main_id)
-  local key = k(main_id)
-  local gid = gid_of(key)
+  local gid = gutters[main_id]
   if not gid then return end
-  local gpane = wezterm.mux.get_pane(gid)
-  if gpane then
-    local mux_win = gpane:window()
-    local gui_win = mux_win and mux_win:gui_window()
-    if gui_win then gui_win:perform_action(CLOSE_PANE, gpane) end
-  end
-  wezterm.GLOBAL.line_time.gutter[key] = nil
-  wezterm.GLOBAL.line_time.stamps[key] = nil
-  wezterm.GLOBAL.line_time.last_count[key] = nil
-  wezterm.GLOBAL.line_time.viewport_top[key] = nil
+  kill_pane(wezterm.mux.get_pane(gid))
+  clear_state(main_id)
 end
 
 local function record_new_lines(main_pane)
-  local id = k(main_pane:pane_id())
+  local id = main_pane:pane_id()
   local dims = main_pane:get_dimensions()
   local text = main_pane:get_logical_lines_as_text(dims.scrollback_rows)
   local count = count_lines(text)
-  local prev = wezterm.GLOBAL.line_time.last_count[id] or 0
+  local prev = last_count[id] or 0
   if count <= prev then return end
   local now = os.date '%H:%M:%S'
   for i = prev + 1, count do
-    wezterm.GLOBAL.line_time.stamps[id][tostring(i)] = now
+    stamps[id][tostring(i)] = now
   end
-  wezterm.GLOBAL.line_time.last_count[id] = count
+  last_count[id] = count
 end
 
 local function render_gutter(main_pane, gutter_pane)
-  local id = k(main_pane:pane_id())
-  local total = wezterm.GLOBAL.line_time.last_count[id] or 0
+  local id = main_pane:pane_id()
+  local total = last_count[id] or 0
   local viewport = main_pane:get_dimensions().viewport_rows
   local top = effective_top(id, total, viewport)
   local lines = {}
+  local stamp_table = stamps[id] or {}
   for i = top, top + viewport - 1 do
-    lines[#lines + 1] = wezterm.GLOBAL.line_time.stamps[id][tostring(i)] or ''
+    lines[#lines + 1] = stamp_table[tostring(i)] or ''
   end
   gutter_pane:inject_output(CLEAR_HOME .. table.concat(lines, '\r\n'))
 end
@@ -190,16 +211,14 @@ end
 -- pcall on the per-pane callback so a single failure (e.g. pane:split
 -- raising for a freshly-spawned window before WezTerm finishes wiring up
 -- its GUI surface) doesn't abort iteration over the rest of the panes.
--- Errors are written to ~/.local/share/wezterm/wezterm-gui.log on macOS;
--- see `wezterm show-log` for live tailing.
 local function each_main_pane(fn)
   for _, mux_win in ipairs(wezterm.mux.all_windows()) do
     for _, tab in ipairs(mux_win:tabs()) do
       for _, pane in ipairs(tab:panes()) do
-        if not is_gutter(pane:pane_id()) then
+        if not is_gutter(pane) then
           local ok, err = pcall(fn, pane)
           if not ok then
-            wezterm.log_error('line_time: pane ' .. tostring(pane:pane_id()) .. ' failed: ' .. tostring(err))
+            dlog('each_main_pane: pane ' .. tostring(pane:pane_id()) .. ' failed: ' .. tostring(err))
           end
         end
       end
@@ -210,66 +229,73 @@ end
 local function instrument_all() each_main_pane(open_gutter) end
 
 local function teardown_all()
-  for main_id in pairs(wezterm.GLOBAL.line_time.gutter) do close_gutter(main_id) end
+  for main_id in pairs(gutters) do close_gutter(main_id) end
 end
 
--- Sweep gutter mapping for entries whose main pane has died. Typical trigger:
--- user pressed Ctrl+D in the main pane, the shell exited, WezTerm dropped the
--- pane — but the sibling gutter (running `sleep`) is still alive, so the tab
--- survives with only timestamps on screen. Reaping the orphan lets the tab/
--- window close in turn. Worst-case latency = one update-status tick (~1s).
--- Also self-heals stale entries left over from config reloads or earlier
--- crashes, since wezterm.GLOBAL outlives the Lua VM.
+-- Sweep mapping for entries whose main pane has died (Ctrl+D, manual close,
+-- etc). The sibling gutter is still alive in mux but now orphaned — kill it
+-- so the tab/window can close in turn. Worst-case latency ≤ 1 tick.
 local function reap_orphan_gutters()
   local dead = {}
-  for main_key in pairs(wezterm.GLOBAL.line_time.gutter) do
-    local pid = tonumber(main_key)
-    if not pid or not wezterm.mux.get_pane(pid) then
-      dead[#dead + 1] = main_key
-    end
+  for main_id in pairs(gutters) do
+    if not wezterm.mux.get_pane(main_id) then dead[#dead + 1] = main_id end
   end
-  for _, key in ipairs(dead) do close_gutter(key) end
+  for _, main_id in ipairs(dead) do close_gutter(main_id) end
 end
 
--- Lazy-opens the gutter for any main pane that doesn't have one yet. This is
--- how the plugin becomes visible on a fresh process (enabled=true by default
--- but apply_to_config runs before mux has any windows — only update-status
--- sees real panes) and how panes spawned later acquire a gutter without a
--- toggle off/on dance. A stale gid (user closed the gutter pane manually) is
--- left alone — open_gutter is no-op when gid is present, regardless of
--- whether the underlying mux pane is still alive.
+-- Find gutter panes that aren't claimed by any main in our mapping (e.g.
+-- left over from a previous session whose main panes died before this VM
+-- started). Kill them so they don't ghost-occupy tabs.
+local function reap_unclaimed_gutters()
+  -- Build set of claimed gutter pane ids.
+  local claimed = {}
+  for _, gid in pairs(gutters) do claimed[gid] = true end
+  for _, mux_win in ipairs(wezterm.mux.all_windows()) do
+    for _, tab in ipairs(mux_win:tabs()) do
+      local panes = tab:panes()
+      -- Only consider gutters orphaned if their tab has no main pane. A
+      -- tab with main + gutter but no mapping entry is fine — open_gutter's
+      -- reclaim path will adopt the gutter on the next tick. Kill only when
+      -- there's literally nothing else in the tab.
+      local has_main = false
+      for _, pane in ipairs(panes) do
+        if not is_gutter(pane) then has_main = true; break end
+      end
+      if not has_main then
+        for _, pane in ipairs(panes) do
+          if is_gutter(pane) and not claimed[pane:pane_id()] then
+            dlog('reap_unclaimed: kill gutter ' .. tostring(pane:pane_id()))
+            kill_pane(pane)
+          end
+        end
+      end
+    end
+  end
+end
+
 local function tick()
-  if not wezterm.GLOBAL.line_time then
-    dlog('tick: no state')
-    return
-  end
-  if not enabled then
-    dlog('tick: disabled')
-    return
-  end
-  local window_count = #wezterm.mux.all_windows()
-  dlog('tick: enabled, windows=' .. window_count)
+  if not enabled then return end
   reap_orphan_gutters()
-  local seen = 0
+  reap_unclaimed_gutters()
   each_main_pane(function(pane)
-    seen = seen + 1
-    local id = k(pane:pane_id())
-    dlog('tick: main pane ' .. id .. ' has_gutter=' .. tostring(wezterm.GLOBAL.line_time.gutter[id] ~= nil))
-    if not wezterm.GLOBAL.line_time.gutter[id] then
+    local id = pane:pane_id()
+    if not gutters[id] then
       open_gutter(pane)
       return
     end
-    local gid = gid_of(id)
-    local gpane = gid and wezterm.mux.get_pane(gid)
-    if not gpane then return end
+    local gpane = wezterm.mux.get_pane(gutters[id])
+    if not gpane then
+      -- Mapping points at a dead gutter — drop it so open_gutter tries again
+      -- (or reclaims a sibling that's still alive) next tick.
+      clear_state(id)
+      return
+    end
     record_new_lines(pane)
     render_gutter(pane, gpane)
   end)
-  dlog('tick: saw ' .. seen .. ' main panes')
 end
 
 local function toggle()
-  init_state()
   enabled = not enabled
   dlog('toggle: enabled=' .. tostring(enabled))
   if enabled then instrument_all() else teardown_all() end
@@ -285,18 +311,18 @@ local function on_scroll(delta_fn)
     local viewport = pane:get_dimensions().viewport_rows
     local delta = delta_fn(viewport)
     window:perform_action(act.ScrollByLine(delta), pane)
-    if not enabled or not wezterm.GLOBAL.line_time then return end
-    if is_gutter(pane:pane_id()) then return end
-    local id = k(pane:pane_id())
-    local gid = gid_of(id)
+    if not enabled then return end
+    if is_gutter(pane) then return end
+    local id = pane:pane_id()
+    local gid = gutters[id]
     if not gid then return end
-    local total = wezterm.GLOBAL.line_time.last_count[id] or 0
+    local total = last_count[id] or 0
     local cur = effective_top(id, total, viewport)
     local new_top = clamp_top(cur + delta, total, viewport)
     if new_top == live_tail_top(total, viewport) then
-      wezterm.GLOBAL.line_time.viewport_top[id] = 0
+      viewport_top[id] = 0
     else
-      wezterm.GLOBAL.line_time.viewport_top[id] = new_top
+      viewport_top[id] = new_top
     end
     local gpane = wezterm.mux.get_pane(gid)
     if gpane then render_gutter(pane, gpane) end
@@ -307,39 +333,8 @@ local M = {}
 
 ---@param config table   wezterm config table being built
 ---@param opts? table    reserved for future options
--- One-shot prune at first apply_to_config in this VM. wezterm.GLOBAL outlives
--- config reloads (and may outlive Cmd+Q via the mux server / validation VMs),
--- so stale entries pointing at dead pane ids accumulate across sessions.
--- Also: with the old buggy is_gutter, gutter panes themselves got recorded
--- as "main" keys — purge those too so they stop hogging slots and prevent
--- their real-main siblings from being processed correctly.
-local pruned_once = false
-local function prune_stale_state()
-  if pruned_once then return end
-  pruned_once = true
-  if not wezterm.GLOBAL.line_time then return end
-  for key, gid in pairs(wezterm.GLOBAL.line_time.gutter) do
-    local main_pid = tonumber(key)
-    local gpid = tonumber(gid)
-    local main_alive = main_pid and wezterm.mux.get_pane(main_pid)
-    local gutter_alive = gpid and wezterm.mux.get_pane(gpid)
-    -- main_pid being a gutter in disguise = the key is in the values set
-    local main_is_gutter = main_pid and is_gutter(main_pid)
-    if not main_alive or not gutter_alive or main_is_gutter then
-      dlog('prune: drop main_key=' .. tostring(key) .. ' gid=' .. tostring(gid))
-      wezterm.GLOBAL.line_time.gutter[key] = nil
-      wezterm.GLOBAL.line_time.stamps[key] = nil
-      wezterm.GLOBAL.line_time.last_count[key] = nil
-      wezterm.GLOBAL.line_time.viewport_top[key] = nil
-    end
-  end
-end
-
 function M.apply_to_config(config, opts)
   dlog('apply_to_config: entered')
-  init_state()
-  prune_stale_state()
-  dlog('apply_to_config: state initialised, enabled=' .. tostring(enabled))
   config.keys = config.keys or {}
   table.insert(config.keys, {
     key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
