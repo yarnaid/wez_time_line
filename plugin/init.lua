@@ -25,6 +25,18 @@ local GUTTER_CMD = { 'sleep', '2147483647' }
 local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
 local CLOSE_PANE = wezterm.action.CloseCurrentPane { confirm = false }
 
+-- DIAGNOSTIC: writes to /tmp/line_time.log unconditionally so we bypass any
+-- ambiguity about where wezterm.log_warn ends up. `tail -F /tmp/line_time.log`
+-- in another tab to watch live. Remove once we've identified the bug.
+local DEBUG_LOG_PATH = '/tmp/line_time.log'
+local function dlog(msg)
+  local f = io.open(DEBUG_LOG_PATH, 'a')
+  if f then
+    f:write(os.date('%H:%M:%S ') .. msg .. '\n')
+    f:close()
+  end
+end
+
 -- wezterm.GLOBAL gotchas (verified empirically against 20240203):
 --   1. `local t = wezterm.GLOBAL.X; t.Y = Z` does NOT propagate — reads return
 --      a snapshot. Always mutate through `wezterm.GLOBAL.line_time.X` directly.
@@ -84,7 +96,7 @@ end
 local function open_gutter(main_pane)
   local id = k(main_pane:pane_id())
   if wezterm.GLOBAL.line_time.gutter[id] then return end
-  wezterm.log_warn('[line_time] opening gutter for pane ' .. id)
+  dlog('open_gutter: pane ' .. id)
   -- pane:split focuses the new pane. Remember the tab's active pane first so
   -- we can hand focus back — otherwise a lazy-open from update-status (or a
   -- toggle while a sibling is focused) yanks the cursor into the gutter.
@@ -207,21 +219,21 @@ end
 -- whether the underlying mux pane is still alive.
 local function tick()
   if not wezterm.GLOBAL.line_time then
-    wezterm.log_warn('[line_time] tick: no state, returning')
+    dlog('tick: no state')
     return
   end
   if not wezterm.GLOBAL.line_time.enabled then
-    wezterm.log_warn('[line_time] tick: disabled, returning')
+    dlog('tick: disabled')
     return
   end
   local window_count = #wezterm.mux.all_windows()
-  wezterm.log_warn('[line_time] tick: enabled=true, windows=' .. window_count)
+  dlog('tick: enabled, windows=' .. window_count)
   reap_orphan_gutters()
   local seen = 0
   each_main_pane(function(pane)
     seen = seen + 1
     local id = k(pane:pane_id())
-    wezterm.log_warn('[line_time] tick: main pane ' .. id .. ', has_gutter=' .. tostring(wezterm.GLOBAL.line_time.gutter[id] ~= nil))
+    dlog('tick: main pane ' .. id .. ' has_gutter=' .. tostring(wezterm.GLOBAL.line_time.gutter[id] ~= nil))
     if not wezterm.GLOBAL.line_time.gutter[id] then
       open_gutter(pane)
       return
@@ -231,12 +243,13 @@ local function tick()
     record_new_lines(pane)
     render_gutter(pane, gpane)
   end)
-  wezterm.log_warn('[line_time] tick: saw ' .. seen .. ' main panes')
+  dlog('tick: saw ' .. seen .. ' main panes')
 end
 
 local function toggle()
   init_state()
   wezterm.GLOBAL.line_time.enabled = not wezterm.GLOBAL.line_time.enabled
+  dlog('toggle: enabled=' .. tostring(wezterm.GLOBAL.line_time.enabled))
   if wezterm.GLOBAL.line_time.enabled then instrument_all() else teardown_all() end
 end
 
@@ -273,7 +286,9 @@ local M = {}
 ---@param config table   wezterm config table being built
 ---@param opts? table    reserved for future options
 function M.apply_to_config(config, opts)
+  dlog('apply_to_config: entered')
   init_state()
+  dlog('apply_to_config: state initialised, enabled=' .. tostring(wezterm.GLOBAL.line_time.enabled))
   config.keys = config.keys or {}
   table.insert(config.keys, {
     key = 'e', mods = 'CMD', action = wezterm.action_callback(toggle),
@@ -292,6 +307,7 @@ function M.apply_to_config(config, opts)
   -- wezterm.on is per-Lua-VM. Each config reload (including validation
   -- threads) gets a fresh VM with no prior handlers — register every time.
   wezterm.on('update-status', tick)
+  dlog('apply_to_config: update-status handler registered')
 end
 
 return M
