@@ -25,6 +25,24 @@ local GUTTER_CMD = { 'sleep', '2147483647' }
 local CLEAR_HOME = '\x1b[?25l\x1b[H\x1b[2J'
 local CLOSE_PANE = wezterm.action.CloseCurrentPane { confirm = false }
 
+-- Opt-in diagnostic logger. Gated by env var LINE_TIME_DEBUG=1 so production
+-- runs pay zero cost (dlog resolves to a no-op closure). When enabled, every
+-- interesting reap/kill decision lands in /tmp/line_time.log — used to trace
+-- whether a pane was killed by a sustained "shell exited" signal (Ctrl+D with
+-- exit_behavior=Hold) or a single-tick race in get_foreground_process_info().
+local dlog = function(_) end
+if os.getenv 'LINE_TIME_DEBUG' == '1' then
+  local DEBUG_LOG_PATH = '/tmp/line_time.log'
+  dlog = function(msg)
+    pcall(function()
+      local f = io.open(DEBUG_LOG_PATH, 'a')
+      if not f then return end
+      f:write(os.date '%H:%M:%S ' .. tostring(msg) .. '\n')
+      f:close()
+    end)
+  end
+end
+
 -- After splitting we mark the new pane with this user var via OSC 1337 so we
 -- can re-discover existing gutter panes across config reloads / VM restarts
 -- without depending on any in-memory mapping. Value is base64("1") = "MQ==".
@@ -53,6 +71,15 @@ local viewport_top = {}   -- [main_id] = pinned top row (0 = follow live tail)
 -- Used to distinguish "shell still booting, no process yet" (don't reap) from
 -- "shell exited but exit_behavior=Hold is keeping the pane around" (do reap).
 local proc_seen = {}      -- [main_id] = true once we've seen any fg process
+-- Consecutive ticks `get_foreground_process_info()` has returned nil after
+-- we've started observing the pane. The function is documented to fail "for
+-- reasons outside of WezTerm's control" — a single nil read is a race (shell
+-- forked a prompt-render subprocess that just exited, hasn't yet reclaimed
+-- the tty foreground pgrp). Require N consecutive nil reads before reaping,
+-- or pressing Enter in a shell with a forky prompt (fish + git, zsh +
+-- starship) will spuriously close the user's pane.
+local proc_nil_streak = {}   -- [main_id] = consecutive nil reads
+local NIL_REAP_THRESHOLD = 3 -- ~3 ticks ≈ 3s tolerance before reaping
 
 -- wezterm.mux.get_pane(id) THROWS a Lua error when the pane id is unknown,
 -- contrary to what one would expect from "get" semantics. Wrap it: a missing
@@ -133,6 +160,7 @@ local function clear_state(main_id)
   last_count[main_id] = nil
   viewport_top[main_id] = nil
   proc_seen[main_id] = nil
+  proc_nil_streak[main_id] = nil
 end
 
 local function open_gutter(main_pane)
@@ -175,6 +203,7 @@ local WEZTERM_BIN = wezterm.executable_dir .. '/wezterm'
 local function kill_pane(gpane)
   if not gpane then return end
   local pid = gpane:pane_id()
+  dlog('kill_pane: id=' .. tostring(pid))
   local mux_win = gpane:window()
   local gui_win = mux_win and mux_win:gui_window()
   if gui_win then
@@ -244,9 +273,14 @@ end
 --   1. mux.get_pane(main_id) returns nil — pane was removed from the mux
 --      (default exit_behavior closes the pane on shell exit).
 --   2. main pane is still in mux but `get_foreground_process_info()` returns
---      nil after we've previously seen a process there — shell exited and
---      exit_behavior = "Hold" / "CloseOnCleanExit" is keeping the pane in a
---      "process gone" state. User pressed Ctrl+D expecting close; honour that.
+--      nil for NIL_REAP_THRESHOLD consecutive ticks after we've previously
+--      seen a process there — shell exited and exit_behavior = "Hold" /
+--      "CloseOnCleanExit" is keeping the pane in a "process gone" state.
+--      The streak gate is load-bearing: WezTerm docs explicitly say the
+--      function "may fail for reasons outside WezTerm's control", so a
+--      single nil read is a race (subprocess fork during prompt render),
+--      not a death signal. Killing on a single nil closed live panes the
+--      instant the user pressed Enter in fish/zsh with a forky prompt.
 -- For case 2 we also force-kill the held main pane via kill_pane, since
 -- otherwise the tab survives with a zombie [Process exited] view.
 local function reap_orphan_gutters()
@@ -254,13 +288,26 @@ local function reap_orphan_gutters()
   for main_id in pairs(gutters) do
     local mp = safe_get_pane(main_id)
     if not mp then
+      dlog('reap: main=' .. tostring(main_id) .. ' gone from mux, queuing kill')
       to_kill[#to_kill + 1] = { main_id = main_id, mp = nil }
     else
       local proc = mp:get_foreground_process_info()
       if proc then
         proc_seen[main_id] = true
+        local prev = proc_nil_streak[main_id] or 0
+        if prev > 0 then
+          dlog('reap: main=' .. tostring(main_id) .. ' proc back after ' .. tostring(prev) .. ' nil reads, streak reset')
+        end
+        proc_nil_streak[main_id] = 0
       elseif proc_seen[main_id] then
-        to_kill[#to_kill + 1] = { main_id = main_id, mp = mp }
+        local n = (proc_nil_streak[main_id] or 0) + 1
+        proc_nil_streak[main_id] = n
+        if n >= NIL_REAP_THRESHOLD then
+          dlog('reap: main=' .. tostring(main_id) .. ' shell exited (streak=' .. tostring(n) .. '/' .. tostring(NIL_REAP_THRESHOLD) .. '), queuing kill')
+          to_kill[#to_kill + 1] = { main_id = main_id, mp = mp }
+        else
+          dlog('reap: main=' .. tostring(main_id) .. ' proc nil but streak=' .. tostring(n) .. '/' .. tostring(NIL_REAP_THRESHOLD) .. ', waiting')
+        end
       end
     end
   end
