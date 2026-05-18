@@ -71,15 +71,18 @@ local viewport_top = {}   -- [main_id] = pinned top row (0 = follow live tail)
 -- Used to distinguish "shell still booting, no process yet" (don't reap) from
 -- "shell exited but exit_behavior=Hold is keeping the pane around" (do reap).
 local proc_seen = {}      -- [main_id] = true once we've seen any fg process
--- Consecutive ticks `get_foreground_process_info()` has returned nil after
--- we've started observing the pane. The function is documented to fail "for
--- reasons outside of WezTerm's control" — a single nil read is a race (shell
--- forked a prompt-render subprocess that just exited, hasn't yet reclaimed
--- the tty foreground pgrp). Require N consecutive nil reads before reaping,
--- or pressing Enter in a shell with a forky prompt (fish + git, zsh +
--- starship) will spuriously close the user's pane.
-local proc_nil_streak = {}   -- [main_id] = consecutive nil reads
-local NIL_REAP_THRESHOLD = 3 -- ~3 ticks ≈ 3s tolerance before reaping
+-- Wall-clock timestamp of the FIRST nil reading from
+-- `get_foreground_process_info()` after we've started observing the pane.
+-- The function is documented to fail "for reasons outside of WezTerm's
+-- control"; a forky prompt (fish + git, zsh + starship, bash + various
+-- async segments) opens a sub-second window between subprocess exit and
+-- the shell calling tcsetpgrp() to reclaim the tty foreground pgrp. We
+-- saw three consecutive nil reads within ONE wall-clock second on Enter
+-- in fish — a tick-count threshold can't tell that from a real exit.
+-- Switch to wall-clock: require continuous nil for NIL_REAP_SECONDS
+-- before queueing the kill. Cleared back to nil on any non-nil read.
+local proc_nil_since = {}        -- [main_id] = os.time() of first nil
+local NIL_REAP_SECONDS = 2       -- continuous nil window before reaping
 
 -- wezterm.mux.get_pane(id) THROWS a Lua error when the pane id is unknown,
 -- contrary to what one would expect from "get" semantics. Wrap it: a missing
@@ -160,7 +163,7 @@ local function clear_state(main_id)
   last_count[main_id] = nil
   viewport_top[main_id] = nil
   proc_seen[main_id] = nil
-  proc_nil_streak[main_id] = nil
+  proc_nil_since[main_id] = nil
 end
 
 local function open_gutter(main_pane)
@@ -272,19 +275,22 @@ end
 -- Sweep mapping for entries whose main pane has died. Two cases:
 --   1. mux.get_pane(main_id) returns nil — pane was removed from the mux
 --      (default exit_behavior closes the pane on shell exit).
---   2. main pane is still in mux but `get_foreground_process_info()` returns
---      nil for NIL_REAP_THRESHOLD consecutive ticks after we've previously
---      seen a process there — shell exited and exit_behavior = "Hold" /
---      "CloseOnCleanExit" is keeping the pane in a "process gone" state.
---      The streak gate is load-bearing: WezTerm docs explicitly say the
---      function "may fail for reasons outside WezTerm's control", so a
---      single nil read is a race (subprocess fork during prompt render),
---      not a death signal. Killing on a single nil closed live panes the
---      instant the user pressed Enter in fish/zsh with a forky prompt.
+--   2. main pane is still in mux but `get_foreground_process_info()` has
+--      been returning nil continuously for at least NIL_REAP_SECONDS after
+--      we've previously seen a process there — shell exited and
+--      exit_behavior = "Hold" / "CloseOnCleanExit" is keeping the pane in
+--      a "process gone" state. The wall-clock gate is load-bearing: docs
+--      explicitly say the function "may fail for reasons outside WezTerm's
+--      control", so any single nil is a race (subprocess fork during
+--      prompt render). A tick-count gate isn't enough — update-status can
+--      fire several times per second when a forky prompt churns, so 3
+--      consecutive nils still landed inside one sub-second race window
+--      and closed live panes on Enter in fish.
 -- For case 2 we also force-kill the held main pane via kill_pane, since
 -- otherwise the tab survives with a zombie [Process exited] view.
 local function reap_orphan_gutters()
   local to_kill = {}
+  local now = os.time()
   for main_id in pairs(gutters) do
     local mp = safe_get_pane(main_id)
     if not mp then
@@ -294,19 +300,20 @@ local function reap_orphan_gutters()
       local proc = mp:get_foreground_process_info()
       if proc then
         proc_seen[main_id] = true
-        local prev = proc_nil_streak[main_id] or 0
-        if prev > 0 then
-          dlog('reap: main=' .. tostring(main_id) .. ' proc back after ' .. tostring(prev) .. ' nil reads, streak reset')
+        if proc_nil_since[main_id] then
+          dlog('reap: main=' .. tostring(main_id) .. ' proc back after ' .. tostring(now - proc_nil_since[main_id]) .. 's nil, clearing')
         end
-        proc_nil_streak[main_id] = 0
+        proc_nil_since[main_id] = nil
       elseif proc_seen[main_id] then
-        local n = (proc_nil_streak[main_id] or 0) + 1
-        proc_nil_streak[main_id] = n
-        if n >= NIL_REAP_THRESHOLD then
-          dlog('reap: main=' .. tostring(main_id) .. ' shell exited (streak=' .. tostring(n) .. '/' .. tostring(NIL_REAP_THRESHOLD) .. '), queuing kill')
-          to_kill[#to_kill + 1] = { main_id = main_id, mp = mp }
+        if not proc_nil_since[main_id] then
+          proc_nil_since[main_id] = now
+          dlog('reap: main=' .. tostring(main_id) .. ' first nil at ' .. tostring(now) .. ', waiting ' .. tostring(NIL_REAP_SECONDS) .. 's')
         else
-          dlog('reap: main=' .. tostring(main_id) .. ' proc nil but streak=' .. tostring(n) .. '/' .. tostring(NIL_REAP_THRESHOLD) .. ', waiting')
+          local elapsed = now - proc_nil_since[main_id]
+          if elapsed >= NIL_REAP_SECONDS then
+            dlog('reap: main=' .. tostring(main_id) .. ' shell exited (nil for ' .. tostring(elapsed) .. 's), queuing kill')
+            to_kill[#to_kill + 1] = { main_id = main_id, mp = mp }
+          end
         end
       end
     end
